@@ -118,7 +118,7 @@ try{
     const info=report.build_info;assert.notEqual(info,null);assert.equal(info.go_version,bootstrap.go_version);
     assert.deepEqual(before.subarray(info.version_location.offset,info.version_location.offset+info.version_location.bytes),Buffer.from(info.go_version_bytes_base64,'base64'));
     assert.deepEqual(before.subarray(info.module_location.offset,info.module_location.offset+info.module_location.bytes),Buffer.from(info.module_bytes_base64,'base64'));
-    assert.equal(info.module.path,'rea.example/arm64-cloud');assert.deepEqual(info.module.main,{path:'rea.example/arm64-cloud',version:'(devel)',sum:null,replacement:null});assert.deepEqual(info.module.dependencies,[]);
+    assert.equal(info.module.path,'rea.example/arm64-cloud');assert.deepEqual(info.module.main,{path:'rea.example/arm64-cloud',version:'(devel)',sum:'',replacement:null});assert.deepEqual(info.module.dependencies,[]);
     assert.equal(info.module.complete,true);assert.deepEqual(info.module.unparsed_lines,[]);assert.deepEqual(info.module.unparsed_line_bytes_base64,[]);
     const settings=new Map(info.module.settings.map(x=>[x.key,x.value]));assert.equal(settings.get('GOOS'),bootstrap.native_os);assert.equal(settings.get('GOARCH'),'arm64');assert.equal(settings.get('CGO_ENABLED'),'0');
    }else{
