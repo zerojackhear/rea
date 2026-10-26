@@ -135,3 +135,64 @@ export function formArgumentsToJson(fields, values) {
   if (result.errors.length) return { ok: false, errors: result.errors };
   return { ok: true, value: JSON.stringify(result.arguments, null, 2) };
 }
+
+/** Build field values only when each present JSON value has a lossless form representation. */
+export function jsonArgumentsToForm(fields, raw) {
+  let values;
+  try {
+    values = readJsonArguments(raw);
+  } catch (error) {
+    return { ok: false, errors: [{ message: error.message }] };
+  }
+  const known = new Set(fields.map((field) => field.key));
+  const errors = Object.keys(values)
+    .filter((key) => !known.has(key))
+    .map((key) => ({
+      key,
+      message: "JSON 中的字段不在表单中，请保留 JSON 模式。",
+    }));
+  const entries = [];
+  for (const field of fields) {
+    if (!Object.hasOwn(values, field.key)) {
+      entries.push([field.key, ""]);
+      continue;
+    }
+    const value = values[field.key];
+    const type = fieldType(field.schema);
+    let rendered;
+    if (type === "json") {
+      try {
+        rendered = JSON.stringify(value, null, 2);
+      } catch (error) {
+        errors.push({ key: field.key, message: error.message });
+      }
+    } else if (
+      (type === "string" || type === "enum") &&
+      typeof value === "string" &&
+      value !== "" &&
+      (type !== "enum" || field.schema.enum.includes(value))
+    ) {
+      rendered = value;
+    } else if (type === "boolean" && typeof value === "boolean") {
+      rendered = String(value);
+    } else if (
+      (type === "number" || type === "integer") &&
+      typeof value === "number" &&
+      Number.isFinite(value) &&
+      !Object.is(value, -0) &&
+      (type !== "integer" || Number.isInteger(value))
+    ) {
+      rendered = String(value);
+    } else {
+      errors.push({
+        key: field.key,
+        message:
+          "此 JSON 值无法无损转为表单输入，请保留 JSON 模式；原文未改变。",
+      });
+    }
+    if (rendered !== undefined) entries.push([field.key, rendered]);
+  }
+  return errors.length
+    ? { ok: false, errors }
+    : { ok: true, value: Object.fromEntries(entries) };
+}

@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 
 import canonicalize from "canonicalize";
 import { z } from "zod";
+import { utcDateTimeSchema } from "./offsetDateTime.js";
 
 import { IDENTIFIER_PATTERN } from "./stringPatterns.js";
 
@@ -85,7 +86,7 @@ const verifierContractSchema = z.strictObject({
 const conformancePackageContentsSchema = z.strictObject({
   name: z.string().min(1),
   description: z.string().min(1),
-  created_at: z.string().datetime(),
+  created_at: utcDateTimeSchema,
   /** Scenario manifests. */
   scenarios: z.array(scenarioManifestSchema).min(1),
   /** Exactly one replay plan for each scenario. */

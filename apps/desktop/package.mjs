@@ -7,9 +7,10 @@ import {
   rename,
   writeFile,
 } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import {
   appSourceRoot,
+  assertPackageOutputRoot,
   copyCheckedFile,
   copyTree,
   parseOptions,
@@ -123,8 +124,17 @@ async function main() {
     "Incomplete core package file manifest.",
   );
   const outputRoot = resolve(
-    options["--output-root"] ?? join(repositoryRoot, "dist/desktop"),
+    options["--output-root"] ??
+      join(repositoryRoot, ".cache/desktop-deliveries"),
   );
+  await assertPackageOutputRoot(outputRoot, {
+    repository: repositoryRoot,
+    recursiveSources: [
+      electron.runtime,
+      join(appSourceRoot, "renderer"),
+      join(appSourceRoot, "examples"),
+    ],
+  });
   await mkdir(outputRoot, { recursive: true });
   const stamp = new Date()
     .toISOString()
@@ -154,6 +164,7 @@ async function main() {
   const desktopFiles = [];
   for (const name of [
     "package.json",
+    "runtime-pins.mjs",
     "main.mjs",
     "preload.cjs",
     "bridge.mjs",

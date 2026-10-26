@@ -7,10 +7,11 @@ import {
   lstat,
   mkdir,
   mkdtemp,
-  open,
   readFile,
   readdir,
+  realpath,
   rename,
+  unlink,
 } from "node:fs/promises";
 import {
   basename,
@@ -22,6 +23,7 @@ import {
   win32,
 } from "node:path";
 import { fileURLToPath } from "node:url";
+import { PINNED_TOOLS } from "./runtime-pins.mjs";
 
 export const appSourceRoot = dirname(fileURLToPath(import.meta.url));
 export const repositoryRoot = resolve(appSourceRoot, "../..");
@@ -30,29 +32,7 @@ export const toolCacheRoot = join(
   ".cache",
   "desktop-toolchain",
 );
-export const PINNED_TOOLS = Object.freeze({
-  electron: Object.freeze({
-    version: "44.7.0",
-    filename: "electron-v44.7.0-win32-x64.zip",
-    url: "https://github.com/electron/electron/releases/download/v44.7.0/electron-v44.7.0-win32-x64.zip",
-    bytes: 158293649,
-    sha256: "eee30dc8fa1f5ea95490e59f44e46ea68dd24c6e93d22facf70fe5c2d4c2665c",
-    executable: "electron.exe",
-    executableSha256:
-      "2529b494f4123f152bce346051f7bd855ef95006424a561953cf17c49a3d1ba8",
-  }),
-  node: Object.freeze({
-    version: "24.18.0",
-    filename: "node-v24.18.0-win-x64.zip",
-    url: "https://nodejs.org/dist/v24.18.0/node-v24.18.0-win-x64.zip",
-    bytes: 37176245,
-    sha256: "0ae68406b42d7725661da979b1403ec9926da205c6770827f33aac9d8f26e821",
-    directory: "node-v24.18.0-win-x64",
-    executable: "node.exe",
-    executableSha256:
-      "9a4eb5f1c29c6a2e93852ead46b999e284a6a5ca8bab4d4e241d587d025a52de",
-  }),
-});
+export { PINNED_TOOLS } from "./runtime-pins.mjs";
 
 export function requireBuildHost() {
   assert.equal(process.platform, "win32", "Desktop assembly requires Windows.");
@@ -131,6 +111,94 @@ export function safeRelative(path) {
   return parts;
 }
 
+/** Resolve existing ancestors before creating anything, including junction aliases. */
+export async function canonicalCreationPath(path) {
+  let ancestor = resolve(path);
+  const missing = [];
+  for (;;) {
+    let metadata;
+    try {
+      metadata = await lstat(ancestor);
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+      const parent = dirname(ancestor);
+      assert.notEqual(parent, ancestor, "No existing output ancestor: " + path);
+      missing.unshift(basename(ancestor));
+      ancestor = parent;
+      continue;
+    }
+    // Do not reinterpret an unresolved symlink as a nonexistent plain directory.
+    const physical = await realpath(ancestor);
+    if (missing.length) {
+      const resolvedMetadata = metadata.isSymbolicLink()
+        ? await lstat(physical)
+        : metadata;
+      assert.ok(
+        resolvedMetadata.isDirectory(),
+        "Output ancestor is not a directory: " + ancestor,
+      );
+    }
+    return resolve(physical, ...missing);
+  }
+}
+
+/** Reject output inside a source or protected metadata before any target write. */
+export async function assertOutputOutside(output, roots) {
+  const fold = (value) =>
+    process.platform === "win32" ? value.toLowerCase() : value;
+  const destination = fold(await canonicalCreationPath(output));
+  for (const root of roots) {
+    const owner = fold(await canonicalCreationPath(root));
+    const prefix = owner.endsWith(sep) ? owner : owner + sep;
+    assert.ok(
+      destination !== owner && !destination.startsWith(prefix),
+      "Output overlaps a source or protected metadata directory: " +
+        output +
+        " -> " +
+        root,
+    );
+  }
+}
+
+export async function assertPackageOutputRoot(
+  output,
+  { repository, recursiveSources },
+) {
+  const metadataRoots = [
+    join(repository, ".git"),
+    join(repository, ".agents"),
+    join(repository, ".codex"),
+  ];
+  const marker = join(repository, ".git");
+  try {
+    if ((await lstat(marker)).isFile()) {
+      const entry = (await readFile(marker, "utf8")).trim();
+      assert.match(
+        entry,
+        /^gitdir: .+$/,
+        "Invalid worktree Git metadata pointer.",
+      );
+      const gitDirectory = resolve(repository, entry.slice("gitdir: ".length));
+      metadataRoots.push(gitDirectory);
+      try {
+        const common = (
+          await readFile(join(gitDirectory, "commondir"), "utf8")
+        ).trim();
+        assert.ok(
+          common && !common.includes("\n"),
+          "Invalid common Git metadata pointer.",
+        );
+        metadataRoots.push(resolve(gitDirectory, common));
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error;
+      }
+    }
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  await assertOutputOutside(output, [...recursiveSources, ...metadataRoots]);
+}
+
 export async function copyCheckedFile(source, target) {
   const metadata = await lstat(source);
   assert.ok(
@@ -160,6 +228,7 @@ export async function copyTree(source, target, records = [], relative = "") {
     metadata.isDirectory() && !metadata.isSymbolicLink(),
     "Expected an owned regular directory: " + source,
   );
+  await assertOutputOutside(target, [source]);
   for (const entry of await readdir(source, { withFileTypes: true })) {
     const path = relative ? relative + "/" + entry.name : entry.name;
     safeRelative(path);
@@ -266,9 +335,99 @@ async function verifyArchive(path, pin) {
   );
 }
 
-async function downloadArchive(destination, pin) {
-  let url = new URL(pin.url),
-    response;
+/** Curl keeps network bodies as identity bytes; old build-Node never decompresses them. */
+async function curlRaw(url, { destination, maxBytes, timeoutSeconds = 300 }) {
+  const executable = join(
+    process.env.SystemRoot ?? "C:\\Windows",
+    "System32",
+    "curl.exe",
+  );
+  const args = [
+    "-q",
+    "--silent",
+    "--show-error",
+    "--proto",
+    "=https",
+    "--header",
+    "Accept-Encoding: identity",
+    "--connect-timeout",
+    "30",
+    "--max-time",
+    String(timeoutSeconds),
+    "--max-filesize",
+    String(maxBytes),
+  ];
+  if (destination) args.push("--dump-header", "-", "--output", destination);
+  else args.push("--head");
+  args.push(url.href);
+  return new Promise((resolveTransfer, reject) => {
+    const child = spawn(executable, args, {
+      windowsHide: true,
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const chunks = [];
+    let bytes = 0,
+      fault;
+    const timer = setTimeout(
+      () => {
+        fault = new Error("Raw HTTPS transfer timeout.");
+        child.kill();
+      },
+      (timeoutSeconds + 15) * 1000,
+    );
+    child.stdout.on("data", (chunk) => {
+      bytes += chunk.length;
+      if (bytes <= 128 * 1024) chunks.push(chunk);
+      else {
+        fault = new Error("Raw HTTPS response headers exceeded 128 KiB.");
+        child.kill();
+      }
+    });
+    // Diagnostic text may contain signed redirect coordinates; never publish it.
+    child.stderr.resume();
+    child.once("error", (error) => {
+      fault = new Error(
+        "Could not start system curl: " + (error.code ?? error.name),
+      );
+    });
+    child.once("close", (code, signal) => {
+      clearTimeout(timer);
+      if (fault || code !== 0)
+        return reject(
+          fault ??
+            new Error(
+              "Raw HTTPS transfer failed (curl exit " +
+                String(code ?? signal) +
+                "); partial bytes were not admitted.",
+            ),
+        );
+      try {
+        const blocks = Buffer.concat(chunks)
+          .toString("latin1")
+          .split(/\r?\n\r?\n/)
+          .filter((block) => /^HTTP\/[0-9.]+ [0-9]{3}/.test(block));
+        assert.ok(blocks.length, "Missing raw HTTPS response status.");
+        const lines = blocks.at(-1).split(/\r?\n/);
+        const status = Number(
+          /^HTTP\/[0-9.]+ ([0-9]{3})/.exec(lines.shift())[1],
+        );
+        const headers = new Headers();
+        for (const line of lines) {
+          const at = line.indexOf(":");
+          if (at > 0)
+            headers.append(line.slice(0, at), line.slice(at + 1).trim());
+        }
+        resolveTransfer({ status, headers });
+      } catch (error) {
+        reject(error);
+      }
+    });
+  });
+}
+
+export async function downloadPinnedArchive(destination, pin) {
+  let url = new URL(pin.url);
   const allowed = (hostname) =>
     hostname === "nodejs.org" ||
     hostname === "github.com" ||
@@ -281,51 +440,69 @@ async function downloadArchive(destination, pin) {
         allowed(url.hostname),
       "Unexpected tool download host.",
     );
-    response = await fetch(url, {
-      redirect: "manual",
-      headers: {
-        "Accept-Encoding": "identity",
-        "User-Agent": "REA-Desktop-Builder",
-      },
-      signal: AbortSignal.timeout(300000),
-    });
-    if (![301, 302, 303, 307, 308].includes(response.status)) break;
-    const location = response.headers.get("location");
-    await response.body?.cancel();
-    assert.ok(
-      location && redirect < 5,
-      "Tool archive redirect limit exceeded.",
-    );
-    url = new URL(location, url);
-  }
-  assert.equal(response.status, 200, "Tool ZIP download HTTP status.");
-  if (response.headers.has("content-length"))
-    assert.equal(
-      Number(response.headers.get("content-length")),
-      pin.bytes,
-      "HTTP tool ZIP length mismatch.",
-    );
-  const partial = destination + "." + randomUUID() + ".partial";
-  const output = await open(partial, "wx");
-  const hash = createHash("sha256");
-  let bytes = 0;
-  try {
-    for await (const chunk of response.body) {
-      bytes += chunk.length;
-      assert.ok(bytes <= pin.bytes, "Tool archive exceeded its pinned length.");
-      await output.writeFile(chunk);
-      hash.update(chunk);
+    const head = await curlRaw(url, { maxBytes: pin.bytes });
+    if ([301, 302, 303, 307, 308].includes(head.status)) {
+      const location = head.headers.get("location");
+      assert.ok(
+        location && redirect < 5,
+        "Tool archive redirect limit exceeded.",
+      );
+      url = new URL(location, url);
+      continue;
     }
-  } finally {
-    await output.close();
+    assert.equal(head.status, 200, "Tool ZIP HEAD status.");
+    if (head.headers.has("content-length"))
+      assert.equal(
+        Number(head.headers.get("content-length")),
+        pin.bytes,
+        "HTTP tool ZIP length mismatch.",
+      );
+    assert.ok(
+      !head.headers.has("content-encoding") ||
+        head.headers.get("content-encoding") === "identity",
+      "Encoded tool archives are not admitted.",
+    );
+    const partial = destination + "." + randomUUID() + ".partial";
+    const response = await curlRaw(url, {
+      destination: partial,
+      maxBytes: pin.bytes,
+    });
+    if (response.status !== 200) {
+      // A changed redirect may contain temporary authentication in its HTML.
+      await unlink(partial);
+      throw new Error(
+        "Tool archive GET changed after HEAD; no bytes admitted.",
+      );
+    }
+    if (response.headers.has("content-length"))
+      assert.equal(
+        Number(response.headers.get("content-length")),
+        pin.bytes,
+        "Tool ZIP GET length mismatch.",
+      );
+    assert.ok(
+      !response.headers.has("content-encoding") ||
+        response.headers.get("content-encoding") === "identity",
+      "Encoded tool ZIP body rejected.",
+    );
+    const bytes = (await lstat(partial)).size;
+    assert.equal(bytes, pin.bytes, "Incomplete tool archive.");
+    const digest = await sha256(partial);
+    assert.equal(
+      digest,
+      pin.sha256,
+      "Downloaded tool archive SHA-256 mismatch.",
+    );
+    await rename(partial, destination);
+    return {
+      bytes,
+      sha256: digest,
+      source: pin.url,
+      finalOrigin: url.origin,
+      rawIdentityTransfer: true,
+    };
   }
-  assert.equal(bytes, pin.bytes, "Incomplete tool archive.");
-  assert.equal(
-    hash.digest("hex"),
-    pin.sha256,
-    "Downloaded tool archive SHA-256 mismatch.",
-  );
-  await rename(partial, destination);
+  throw new Error("Tool archive redirect limit exceeded.");
 }
 
 async function extractPinnedZip(archive, destination) {
@@ -366,7 +543,7 @@ export async function prepareTool(name, suppliedArchive) {
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
       console.log("Downloading pinned " + name + " " + pin.version);
-      await downloadArchive(archive, pin);
+      await downloadPinnedArchive(archive, pin);
     }
   }
   await verifyArchive(archive, pin);

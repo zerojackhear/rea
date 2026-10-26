@@ -10,22 +10,24 @@ import {
 async function main() {
   const options = parseOptions(process.argv.slice(2), [
     "--electron-zip",
+    "--node-zip",
     "--help",
   ]);
   if (options["--help"]) {
     console.log(
-      "Usage: node apps/desktop/launch.mjs [--electron-zip ABSOLUTE_ZIP]\nRequires Node v24.18.0 Windows x64. Downloads the pinned official Electron ZIP when no archive is supplied.",
+      "Usage: node apps/desktop/launch.mjs [--electron-zip ABSOLUTE_ZIP] [--node-zip ABSOLUTE_ZIP]\nRequires development Node v24.18.0 Windows x64. Downloads complete pinned official Electron and backend Node ZIPs when omitted.",
     );
     return;
   }
   requireBuildHost();
   const electron = await prepareTool("electron", options["--electron-zip"]);
-  const env = { ...process.env, REA_DESKTOP_NODE_EXECUTABLE: process.execPath };
+  const node = await prepareTool("node", options["--node-zip"]);
+  const env = { ...process.env, REA_DESKTOP_NODE_EXECUTABLE: node.executable };
   for (const key of ["ELECTRON_RUN_AS_NODE", "NODE_OPTIONS", "NODE_PATH"])
     delete env[key];
   console.log(
     "Starting REA Desktop with pinned Node " +
-      process.version +
+      node.receipt.version +
       " and Electron " +
       electron.receipt.version,
   );

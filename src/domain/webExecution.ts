@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { utcDateTimeSchema } from "./offsetDateTime.js";
 import { jsonObjectSchema } from "./jsonValue.js";
 import {
   webRuntimeLocationSchema,
@@ -33,8 +34,8 @@ export const webExecutionSchema = z.object({
   browser: browserVersionSchema,
   target: webRuntimeTargetSchema,
   window: z.object({
-    armed_at: z.iso.datetime(),
-    ended_at: z.iso.datetime(),
+    armed_at: utcDateTimeSchema,
+    ended_at: utcDateTimeSchema,
     requested_ms: z.number().int().min(1),
     end_reason: z.enum([
       "window_elapsed",

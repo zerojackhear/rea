@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
+import { isUtf8 } from "node:buffer";
 import {
   mkdir,
   readFile,
@@ -22,6 +23,7 @@ const METHODS = new Set([
   "history",
   "result",
   "close",
+  "acknowledge-close",
 ]);
 const ACTIVE = new Set(["queued", "running"]);
 const TASK_STATES = new Set([
@@ -64,9 +66,11 @@ export function validateRequest(message) {
   const keys =
     message.method === "submit"
       ? ["tool", "arguments"]
-      : ["cancel", "result"].includes(message.method)
-        ? ["id"]
-        : [];
+      : message.method === "acknowledge-close"
+        ? ["acceptUnknownCleanup"]
+        : ["cancel", "result"].includes(message.method)
+          ? ["id"]
+          : [];
   if (Object.keys(payload).some((key) => !keys.includes(key))) {
     throw failure("invalid_request", "Unexpected request fields.");
   }
@@ -87,6 +91,14 @@ export function validateRequest(message) {
   ) {
     throw failure("invalid_request", "Task ID must be a generated UUID.");
   }
+  if (
+    message.method === "acknowledge-close" &&
+    payload.acceptUnknownCleanup !== true
+  )
+    throw failure(
+      "invalid_request",
+      "Explicit acceptance of unknown cleanup is required.",
+    );
   return { id: message.id, method: message.method, payload };
 }
 
@@ -122,10 +134,104 @@ export async function loadRecordingPolicy(coreRoot) {
     load("webNetworkCapture.js"),
     load("explicitSensitiveValues.js"),
   ]);
+
+  // This owner lives for the complete MCP connection. An aborted request does
+  // not end the server's ability to emit its authentication text.
+  const literals = new Set();
+  const redactText = (text) => explicit.redactExplicitText(text, [...literals]);
+  const redactJson = (item) => {
+    if (typeof item === "string") return redactText(item);
+    if (Array.isArray(item)) return item.map(redactJson);
+    if (isRecord(item))
+      return Object.fromEntries(
+        Object.entries(item)
+          .filter(([key]) => redactText(key) === key)
+          .map(([key, child]) => [key, redactJson(child)]),
+      );
+    return item;
+  };
+  const pendingPrefixBytes = (bytes, literal) => {
+    const encoded = Buffer.from(literal, "utf8");
+    if (encoded.toString("utf8") !== literal) return 0;
+    const length = Math.min(bytes.length, encoded.length - 1);
+    if (length <= 0) return 0;
+    // KMP is bounded by the retained 64 KiB stream, even for a long credential.
+    const prefix = new Uint32Array(length);
+    for (let index = 1, matched = 0; index < length; index++) {
+      while (matched && encoded[index] !== encoded[matched])
+        matched = prefix[matched - 1];
+      if (encoded[index] === encoded[matched]) matched++;
+      prefix[index] = matched;
+    }
+    let matched = 0;
+    for (let index = bytes.length - length; index < bytes.length; index++) {
+      while (matched && bytes[index] !== encoded[matched])
+        matched = prefix[matched - 1];
+      if (bytes[index] === encoded[matched]) matched++;
+    }
+    return matched;
+  };
+  const diagnostics = (raw) => {
+    const recorded = redactJson(raw);
+    if (isRecord(raw?.stderr)) {
+      const bytes =
+        typeof raw.stderr.base64 === "string"
+          ? Buffer.from(raw.stderr.base64, "base64")
+          : Buffer.from(raw.stderr.text ?? "", "utf8");
+      // A split credential must not be persisted between chunks or at a budget
+      // cut. Source bytes remain bounded and distinct from projected bytes.
+      const incomplete =
+        raw.process?.closeObserved !== true || raw.stderr.truncated === true;
+      const decoded = bytes.toString("utf8");
+      const scrubbed = redactText(decoded);
+      let projected =
+        scrubbed === decoded ? bytes : Buffer.from(scrubbed, "utf8");
+      if (scrubbed !== decoded && incomplete && !isUtf8(bytes)) {
+        // UTF-8 may end between chunks. Redact the complete text, retaining at
+        // most three undecoded source bytes for the same byte-prefix policy.
+        for (let tail = 1; tail <= Math.min(3, bytes.length); tail++) {
+          const complete = bytes.subarray(0, bytes.length - tail);
+          if (!isUtf8(complete)) continue;
+          projected = Buffer.concat([
+            Buffer.from(redactText(complete.toString("utf8")), "utf8"),
+            bytes.subarray(bytes.length - tail),
+          ]);
+          break;
+        }
+      }
+      let pending = 0;
+      if (incomplete)
+        for (const literal of literals)
+          pending = Math.max(pending, pendingPrefixBytes(projected, literal));
+      // Remove an unfinished suffix only after complete matches are redacted:
+      // a self-overlapping credential must not be cut into an exposed prefix.
+      const safeBytes = projected.subarray(0, projected.length - pending);
+      const text = safeBytes.toString("utf8");
+      const changed =
+        pending > 0 || !safeBytes.equals(bytes) || text !== raw.stderr.text;
+      recorded.stderr = {
+        ...recorded.stderr,
+        text,
+        base64: safeBytes.toString("base64"),
+        bytesRetained: safeBytes.length,
+        ...(changed
+          ? {
+              sourceBytesRetained: bytes.length,
+              desktopProjection:
+                "desktop-redacted; authentication text excluded from recorded diagnostics",
+            }
+          : {}),
+        ...(pending ? { pendingCredentialPrefixBytes: pending } : {}),
+      };
+    }
+    return recorded;
+  };
   return {
+    redactText,
+    redactJson,
+    diagnostics,
     project(tool, input) {
       const original = snapshot(input),
-        literals = new Set(),
         omittedFields = [];
       const add = (value) => {
         if (typeof value === "string" && value !== "") literals.add(value);
@@ -232,19 +338,6 @@ export async function loadRecordingPolicy(coreRoot) {
           }
         });
       }
-      const redactText = (text) =>
-        explicit.redactExplicitText(text, [...literals]);
-      const redactJson = (item) => {
-        if (typeof item === "string") return redactText(item);
-        if (Array.isArray(item)) return item.map(redactJson);
-        if (isRecord(item))
-          return Object.fromEntries(
-            Object.entries(item)
-              .filter(([key]) => redactText(key) === key)
-              .map(([key, child]) => [key, redactJson(child)]),
-          );
-        return item;
-      };
       const recordInput = (item) => {
         if (typeof item === "string") {
           const coordinates = transportUrl.parseRecordedTransportUrl(item);
@@ -280,39 +373,7 @@ export async function loadRecordingPolicy(coreRoot) {
               replayable: false,
             }
           : undefined,
-        diagnostics(raw) {
-          const recorded = redactJson(raw);
-          if (isRecord(raw?.stderr)) {
-            const text =
-              typeof raw.stderr.text === "string"
-                ? redactText(raw.stderr.text)
-                : "";
-            const bytes =
-              typeof raw.stderr.base64 === "string"
-                ? Buffer.from(raw.stderr.base64, "base64")
-                : Buffer.from(raw.stderr.text ?? "", "utf8");
-            const decoded = bytes.toString("utf8"),
-              safeText = redactText(decoded);
-            const safeBytes =
-              safeText === decoded ? bytes : Buffer.from(safeText, "utf8");
-            const changed =
-              text !== raw.stderr.text || !safeBytes.equals(bytes);
-            recorded.stderr = {
-              ...recorded.stderr,
-              text,
-              base64: safeBytes.toString("base64"),
-              bytesRetained: safeBytes.length,
-              ...(changed
-                ? {
-                    sourceBytesRetained: bytes.length,
-                    desktopProjection:
-                      "desktop-redacted; original authentication text not retained",
-                  }
-                : {}),
-            };
-          }
-          return recorded;
-        },
+        diagnostics,
       };
     },
   };
@@ -342,7 +403,6 @@ export class OwnedStdioTransport {
     this.closeObservation = undefined;
     this.stderrParts = [];
     this.stderrBytes = 0;
-    this.retainedStderrBytes = 0;
     this.sourceRetainedStderrBytes = 0;
     this.closed = new Promise((resolveClosed) => {
       this.resolveClosed = resolveClosed;
@@ -396,7 +456,6 @@ export class OwnedStdioTransport {
       );
       if (retained.length) {
         this.stderrParts.push(Buffer.from(retained));
-        this.retainedStderrBytes += retained.length;
         this.sourceRetainedStderrBytes += retained.length;
       }
     });
@@ -442,19 +501,6 @@ export class OwnedStdioTransport {
     });
   }
 
-  redactDiagnostics(redactText) {
-    const before = Buffer.concat(this.stderrParts);
-    const decoded = before.toString("utf8");
-    const projected = redactText(decoded);
-    if (projected !== decoded) {
-      const after = Buffer.from(projected, "utf8");
-      this.sourceStderrBytesRetained ??= before.length;
-      this.stderrDesktopRedacted = true;
-      this.stderrParts = [after];
-      this.retainedStderrBytes = after.length;
-    }
-  }
-
   diagnostics() {
     const retained = Buffer.concat(this.stderrParts);
     return {
@@ -465,13 +511,6 @@ export class OwnedStdioTransport {
         truncated: this.stderrBytes > this.sourceRetainedStderrBytes,
         text: retained.toString("utf8"),
         base64: retained.toString("base64"),
-        ...(this.stderrDesktopRedacted
-          ? {
-              sourceBytesRetained: this.sourceRetainedStderrBytes,
-              desktopProjection:
-                "desktop-redacted; original authentication text not retained",
-            }
-          : {}),
       },
       ...(this.closeObservation
         ? { process: { ...this.closeObservation } }
@@ -659,7 +698,7 @@ export function createDesktopEngine({
     setState({
       connection: "error",
       error:
-        current?.recording.redactText(describeError(error).message) ??
+        recordingPolicy?.redactText(describeError(error).message) ??
         describeError(error).message,
     });
     if (current) current.controller.abort(error);
@@ -770,6 +809,22 @@ export function createDesktopEngine({
         return [...tasks.values()].map(summary).reverse();
       }
       if (request.method === "close") return engine.close();
+      if (request.method === "acknowledge-close") {
+        // Only this owner can attest that its work and durable records settled.
+        // A lower MCP close observation alone cannot release the sidecar.
+        const receipt = await engine.close();
+        if (
+          receipt.closed !== true ||
+          receipt.cleanupUnknown !== true ||
+          receipt.desktopOwner?.acknowledgementRequired !== true ||
+          receipt.desktopOwner?.resourcesSettled !== true
+        )
+          throw failure(
+            "desktop_owner_not_settled",
+            "The desktop owner has not settled all resources and durable records.",
+          );
+        return { accepted: true, cleanupUnknown: true };
+      }
       await initialization;
       if (request.method === "tools") {
         if (state.connection !== "ready")
@@ -966,6 +1021,14 @@ export function createDesktopEngine({
           }
           if (directory && tasks.size) await saveIndex();
           await persistence;
+          if (receipt.cleanupUnknown === true)
+            return {
+              ...receipt,
+              desktopOwner: {
+                acknowledgementRequired: true,
+                resourcesSettled: true,
+              },
+            };
         } else setState({ connection: "error", error: receipt.message });
         return receipt;
       })();
@@ -1040,7 +1103,6 @@ export function createDesktopEngine({
             };
           }
         }
-        connection.transport.redactDiagnostics?.(active.recording.redactText);
         const taskState =
           active.cancelRequested && caught
             ? "cancelled"
@@ -1057,7 +1119,7 @@ export function createDesktopEngine({
           finalTask.error =
             "REA returned a tool failure; consult the preserved MCP diagnostic.";
         const diagnostic = {
-          ...active.recording.diagnostics(connection.transport.diagnostics()),
+          ...recordingPolicy.diagnostics(connection.transport.diagnostics()),
           ...(caught ? { requestError: caught } : {}),
           ...(redactedPreview
             ? {
@@ -1143,10 +1205,11 @@ async function startIpcEngine() {
           );
         });
         if (
-          request.method === "close" &&
-          value.closed &&
-          !value.cleanupUnknown &&
-          process.connected
+          process.connected &&
+          ((request.method === "close" &&
+            value.closed &&
+            !value.cleanupUnknown) ||
+            (request.method === "acknowledge-close" && value.accepted === true))
         )
           process.disconnect();
       } catch (error) {

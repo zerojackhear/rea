@@ -1,26 +1,26 @@
 # REA Desktop (Windows x64 development build)
 
-Desktop adds a local Electron interface to the existing REA MCP runtime. The renderer is isolated; it receives named application operations rather than a shell or executable launcher. Core analysis still runs in a separate pinned Node process. External providers remain bring-your-own, and unavailable capabilities keep REA's original errors and limitations.
+Desktop adds a local Electron interface to the existing REA MCP runtime. The renderer is isolated; it receives named application operations rather than a shell or executable launcher. Core analysis runs in a separate pinned Node 24.22.1 process; Electron is pinned to 44.9.1. Runtime versions and complete archive pins have one owner in `runtime-pins.mjs`. Repository development/build checks remain on Node 24.18.0 and npm 11.16.0; no global runtime is upgraded. External providers remain bring-your-own, and unavailable capabilities keep REA's original errors and limitations.
 
 ## Run from source
 
 First install the repository's locked dependencies, provide a Windows native artifact that matches this exact core version/source, and run `npm run build:cached` with Node 24.18.0 and npm 11.16.0. Then run:
 
 ```powershell
-node apps/desktop/launch.mjs --electron-zip C:\path\electron-v44.7.0-win32-x64.zip
+node apps/desktop/launch.mjs --electron-zip C:\path\electron-v44.9.1-win32-x64.zip --node-zip C:\path\node-v24.22.1-win-x64.zip
 ```
 
-The launcher checks the complete ZIP against its pinned size and SHA-256, extracts a new owned runtime, and starts Electron with `windowsHide: true`. It passes its exact Node executable to the application. No global Node/npm setting is changed. Omitting `--electron-zip` uses the fixed official HTTPS URL and the same admission checks. Failed downloads and prior extractions remain in `.cache/desktop-toolchain/` for diagnosis; the scripts do not recursively delete them.
+The launcher checks the complete ZIP against its pinned size and SHA-256, extracts a new owned runtime, and starts Electron with `windowsHide: true`. It separately admits the complete Node 24.22.1 ZIP and passes that executable to the application; the development Node running the launcher is not the backend runtime. No global Node/npm setting is changed. Omitting `--electron-zip` or `--node-zip` uses that tool's fixed official HTTPS URL and the same admission checks. Bootstrap downloads use system curl with identity bytes, manual HTTPS host-checked redirects, and no transparent content decompression in the old development Node. Failed downloads and prior extractions remain in `.cache/desktop-toolchain/` for diagnosis; the scripts do not recursively delete them.
 
 ## Build a portable directory and ZIP
 
 ```powershell
-node apps/desktop/package.mjs --electron-zip C:\path\electron-v44.7.0-win32-x64.zip --node-zip C:\path\node-v24.18.0-win-x64.zip --npm-cli C:\path\npm\bin\npm-cli.js
+node apps/desktop/package.mjs --electron-zip C:\path\electron-v44.9.1-win32-x64.zip --node-zip C:\path\node-v24.22.1-win-x64.zip --npm-cli C:\path\npm\bin\npm-cli.js
 ```
 
-Run this command with Node 24.18.0 Windows x64 after the standard core build. npm must be 11.16.0. The builder prefers the explicit `--npm-cli`, then `npm_execpath`, then npm from the verified Node ZIP; it refuses a different version instead of upgrading globally. Optional `--output-root DIRECTORY` selects the output parent. `--no-zip` creates only the portable directory. Both scripts support `--help`.
+Run this command with Node 24.18.0 Windows x64 after the standard core build. npm must be 11.16.0. The new Node runtime archive bundles npm 11.19.1, so pass the isolated 11.16.0 CLI explicitly when invoking the builder directly. The builder prefers the explicit `--npm-cli`, then `npm_execpath`, then npm from the verified Node ZIP; it refuses a different version instead of upgrading globally. Optional `--output-root DIRECTORY` selects the output parent. `--no-zip` creates only the portable directory. Both scripts support `--help`.
 
-Each build creates a new versioned timestamp directory under `dist/desktop/`; it never replaces an old delivery. Double-click `REA.exe` inside that directory, or extract the complete ZIP and run it. Keep the entire directory together. The packaged application uses `resources/runtime/node.exe` and `resources/core`, so it does not need Node or npm on the destination computer's PATH.
+Each build creates a new versioned timestamp directory under `.cache/desktop-deliveries/`; it never replaces an old delivery. Standard core build cleanup does not remove this delivery directory. Explicit output roots inside recursively copied renderer/examples or protected Git/agent metadata are rejected before output creation, including junction aliases. Double-click `REA.exe` inside that directory, or extract the complete ZIP and run it. Keep the entire directory together. The packaged application uses `resources/runtime/node.exe` and `resources/core`, so it does not need Node or npm on the destination computer's PATH.
 
 The layout contains the fresh, completely verified Electron distribution and its notices, the pinned Node executable and LICENSE, the desktop application/renderer/self-owned examples, and REA's npm package contents. Core is copied using `npm pack --json --dry-run --ignore-scripts` file metadata with relative-path validation; the repository, `.git`, `.cache`, source tests, development tools and user credentials are not copied. Its lockfile drives a separate `npm ci --omit=dev --ignore-scripts --no-audit --no-fund`. Production optional platform packages remain enabled for node-pty. No dependency lifecycle script runs.
 

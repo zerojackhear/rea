@@ -10,10 +10,12 @@ import {
 } from "electron";
 import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { EngineBridge } from "./bridge.mjs";
+import { randomUUID } from "node:crypto";
+import { EngineBridge, canAcknowledgeUnknownClose } from "./bridge.mjs";
+import { DESKTOP_NODE_VERSION } from "./runtime-pins.mjs";
 
 const appRoot = dirname(fileURLToPath(import.meta.url));
 const rendererRoot = join(appRoot, "renderer");
@@ -60,20 +62,80 @@ else {
     closing = true;
     void (async () => {
       try {
-        const result = engine ? await engine.close() : { closed: true };
-        if (!result.closed || result.cleanupUnknown)
-          throw new Error(result.message ?? "分析引擎仍保留未清理的资源。");
-        canQuit = true;
-        app.quit();
+        const result = engine
+          ? await engine.close()
+          : { closed: true, cleanupUnknown: false, notStarted: true };
+        if (result.closed && result.cleanupUnknown === false) {
+          canQuit = true;
+          app.quit();
+          return;
+        }
+        if (canAcknowledgeUnknownClose(result)) {
+          const decision = await dialog.showMessageBox(mainWindow, {
+            type: "warning",
+            title: "分析服务已退出",
+            message: "外部资源的清理状态仍未知",
+            detail:
+              "继续等待或关闭界面。磁盘上已有的任务记录会保留；未完成任务的结果、目标状态及清理情况不会被标记为成功。关闭界面不会强制结束其他进程。",
+            buttons: ["返回工作台", "保留故障说明并关闭"],
+            defaultId: 0,
+            cancelId: 0,
+          });
+          if (decision.response !== 1) return;
+          try {
+            const directory = join(app.getPath("userData"), "diagnostics");
+            await mkdir(directory, { recursive: true });
+            await writeFile(
+              join(directory, "shutdown-unknown-" + randomUUID() + ".json"),
+              JSON.stringify(
+                {
+                  schemaVersion: 1,
+                  kind: "desktop-shutdown",
+                  observedAt: new Date().toISOString(),
+                  userAcknowledgedUnknownCleanup: true,
+                  cleanup: "unknown",
+                  sidecar: result.sidecar ?? null,
+                  reaProcess: result.process ?? null,
+                  note: "Saved records were retained. This acknowledgement issued no kill command; target state and prior cleanup remain unknown.",
+                },
+                null,
+                2,
+              ) + "\n",
+              { encoding: "utf8", flag: "wx" },
+            );
+          } catch {
+            const failure = await dialog.showMessageBox(mainWindow, {
+              type: "warning",
+              title: "故障说明未保存",
+              message: "无法写入新的故障说明，清理状态仍未知",
+              detail:
+                "现有磁盘记录不会被删除。你仍可以返回工作台，或明确选择关闭界面。",
+              buttons: ["返回工作台", "仍然关闭界面"],
+              defaultId: 0,
+              cancelId: 0,
+            });
+            if (failure.response !== 1) return;
+          }
+          const acknowledged = await engine.acknowledgeUnknownClose();
+          if (!acknowledged.closed)
+            throw new Error("桌面服务仍未退出，其所有权已保留。请稍后重试。");
+          canQuit = true;
+          app.quit();
+          return;
+        }
+        throw new Error(
+          result.message ?? "仍有活动资源或未保存的结果，请先处理后重试。",
+        );
       } catch (error) {
-        closing = false;
         await dialog.showMessageBox(mainWindow, {
           type: "warning",
           title: "等待分析任务结束",
           message: "当前还不能确认分析资源已关闭",
-          detail: error.message + "\n请先取消活动任务，再重试关闭。",
+          detail: error.message + "\n请先取消活动任务、保存结果，或稍后重试。",
           buttons: ["返回工作台"],
         });
+      } finally {
+        if (!canQuit) closing = false;
       }
     })();
   });
@@ -217,8 +279,13 @@ else {
           windowsHide: true,
           timeout: 10_000,
         });
-        if (stdout.trim() !== "v24.18.0")
-          throw new Error("需要固定 Node v24.18.0，当前为 " + stdout.trim());
+        if (stdout.trim() !== "v" + DESKTOP_NODE_VERSION)
+          throw new Error(
+            "需要固定 Node v" +
+              DESKTOP_NODE_VERSION +
+              "，当前为 " +
+              stdout.trim(),
+          );
         await readFile(join(coreRoot, "dist/mcp/main.js"));
         engine = new EngineBridge({
           node: nodePath,
@@ -241,7 +308,6 @@ else {
     })
     .catch((error) => {
       dialog.showErrorBox("REA Desktop 启动失败", error.message);
-      canQuit = true;
       app.quit();
     });
 }

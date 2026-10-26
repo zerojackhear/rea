@@ -1,12 +1,6 @@
 import { modules, icons, classifyTool, moduleForPath } from "./modules.mjs";
-import {
-  schemaFields,
-  fieldType,
-  defaultFieldValue,
-  readFormArguments,
-  formArgumentsToJson,
-  readJsonArguments,
-} from "./schema.mjs";
+import { fieldType } from "./schema.mjs";
+import { ToolDraftStore } from "./drafts.mjs";
 
 const api = window.rea;
 const content = document.querySelector("#content");
@@ -22,9 +16,7 @@ const state = {
   selectedTool: null,
   selectedPath: "",
   panelTab: "parameters",
-  formMode: "fields",
-  drafts: new Map(),
-  rawDrafts: new Map(),
+  drafts: new ToolDraftStore(),
   errors: [],
   formError: "",
   activeTaskId: null,
@@ -210,7 +202,6 @@ function navigate(view, moduleId, toolName) {
       ? state.tools.find((tool) => tool.name === toolName)
       : choosePreferred(tools, state.moduleId);
     state.panelTab = "parameters";
-    state.formMode = "fields";
     if (state.selectedTool) ensureDraft(state.selectedTool);
   }
   render();
@@ -231,31 +222,7 @@ function choosePreferred(tools, id) {
   );
 }
 function ensureDraft(tool) {
-  if (!state.drafts.has(tool.name)) {
-    const entries = schemaFields(tool.inputSchema).map((field) => [
-      field.key,
-      defaultFieldValue(field.schema),
-    ]);
-    const draft = Object.fromEntries(entries);
-    if (state.selectedPath) {
-      const fields = schemaFields(tool.inputSchema);
-      const pathField = fields.find(
-        (field) =>
-          /^(path|target_path|file_path|binary_path|artifact_path|application_path|application_root|database_path|input_path|root|directory)$/.test(
-            field.key,
-          ) && fieldType(field.schema) === "string",
-      );
-      if (pathField) draft[pathField.key] = state.selectedPath;
-    }
-    state.drafts.set(tool.name, draft);
-  }
-  if (!state.rawDrafts.has(tool.name)) {
-    const parsed = readFormArguments(
-      schemaFields(tool.inputSchema),
-      state.drafts.get(tool.name),
-    );
-    state.rawDrafts.set(tool.name, JSON.stringify(parsed.arguments, null, 2));
-  }
+  return state.drafts.get(tool, state.selectedPath);
 }
 function renderSidebar() {
   const primary = document.querySelector("#primary-nav");
@@ -377,9 +344,8 @@ async function pickTarget(kind) {
   const moduleId = kind === "directory" ? "javascript" : moduleForPath(path);
   navigate("module", moduleId);
   if (state.selectedTool) {
-    state.drafts.delete(state.selectedTool.name);
-    state.rawDrafts.delete(state.selectedTool.name);
-    ensureDraft(state.selectedTool);
+    const selected = state.drafts.applyPath(state.selectedTool, path);
+    if (!selected.ok) toast(selected.message, true);
     render();
   }
 }
@@ -389,8 +355,7 @@ async function analyzeExample() {
   if (!tool) throw new Error("示例分析工具尚未就绪，请先等待本地引擎连接。");
   state.selectedPath = example.path;
   navigate("module", classifyTool(tool), tool.name);
-  state.rawDrafts.set(tool.name, JSON.stringify(example.arguments, null, 2));
-  state.formMode = "json";
+  state.drafts.replaceArguments(tool, example.arguments);
   await submitTool();
 }
 function renderHome(container) {
@@ -456,9 +421,8 @@ function renderHome(container) {
         file.name.includes(".") ? moduleForPath(path) : "javascript",
       );
       if (state.selectedTool) {
-        state.drafts.delete(state.selectedTool.name);
-        state.rawDrafts.delete(state.selectedTool.name);
-        ensureDraft(state.selectedTool);
+        const selected = state.drafts.applyPath(state.selectedTool, path);
+        if (!selected.ok) toast(selected.message, true);
         render();
       }
     } catch (error) {
@@ -698,7 +662,6 @@ function renderToolList(list, tools) {
         state.panelTab = "parameters";
         state.formError = "";
         state.errors = [];
-        state.formMode = "fields";
         ensureDraft(tool);
         renderToolList(list, tools);
         renderWorkPanel(document.querySelector("#work-panel"));
@@ -756,7 +719,7 @@ function renderWorkPanel(panel) {
     return;
   }
   const tool = state.selectedTool;
-  ensureDraft(tool);
+  const draft = ensureDraft(tool);
   panel.append(
     append(
       el("div", "tool-description"),
@@ -788,10 +751,10 @@ function renderWorkPanel(panel) {
   );
   const segmented = el("div", "segmented");
   segmented.append(
-    button("表单", state.formMode === "fields" ? "active" : "", () =>
+    button("表单", draft.mode === "fields" ? "active" : "", () =>
       switchFormMode("fields"),
     ),
-    button("JSON", state.formMode === "json" ? "active" : "", () =>
+    button("JSON", draft.mode === "json" ? "active" : "", () =>
       switchFormMode("json"),
     ),
   );
@@ -803,8 +766,8 @@ function renderWorkPanel(panel) {
     event.preventDefault();
     submitTool().catch(showError);
   });
-  const fields = schemaFields(tool.inputSchema);
-  if (state.formMode === "json" || !fields.length) {
+  const fields = draft.definitions;
+  if (draft.mode === "json" || !fields.length) {
     form.append(
       el(
         "p",
@@ -815,15 +778,15 @@ function renderWorkPanel(panel) {
     const editor = el("textarea", "json-editor");
     editor.spellcheck = false;
     editor.setAttribute("aria-label", "工具参数 JSON");
-    editor.value = state.rawDrafts.get(tool.name) ?? "{}";
+    editor.value = draft.json;
     editor.addEventListener("input", () =>
-      state.rawDrafts.set(tool.name, editor.value),
+      state.drafts.setJson(tool, editor.value),
     );
     editor.addEventListener("keydown", insertTab);
     form.append(editor);
   } else {
-    const values = state.drafts.get(tool.name);
-    for (const field of fields) form.append(renderField(field, values));
+    for (const field of fields)
+      form.append(renderField(field, draft.values, tool));
   }
   panel.append(form);
   if (state.formError) panel.append(el("div", "error-banner", state.formError));
@@ -838,62 +801,21 @@ function renderWorkPanel(panel) {
   panel.append(footer);
 }
 function switchFormMode(mode) {
-  if (!state.selectedTool || mode === state.formMode) return;
-  const tool = state.selectedTool;
-  if (mode === "json") {
-    const result = formArgumentsToJson(
-      schemaFields(tool.inputSchema),
-      state.drafts.get(tool.name),
-    );
-    if (!result.ok) {
-      state.errors = result.errors;
-      state.formError =
-        "部分参数格式需要检查，暂未切换到 JSON。原有输入已完整保留。";
-      renderWorkPanel(document.querySelector("#work-panel"));
-      return;
-    }
-    state.rawDrafts.set(tool.name, result.value);
+  if (!state.selectedTool) return;
+  const result = state.drafts.switchMode(state.selectedTool, mode);
+  if (!result.ok) {
+    state.errors = result.errors;
+    state.formError =
+      result.errors
+        .map((error) => (error.key ? error.key + ": " : "") + error.message)
+        .join("\n") + "\n暂未切换模式，原有输入已完整保留。";
   } else {
-    try {
-      const values = readJsonArguments(state.rawDrafts.get(tool.name) ?? "{}");
-      const fields = schemaFields(tool.inputSchema);
-      const known = new Set(fields.map((field) => field.key));
-      const extras = Object.keys(values).filter((key) => !known.has(key));
-      if (extras.length) {
-        toast(
-          "JSON 中含表单未定义的字段，请保留 JSON 模式，避免丢失参数。",
-          true,
-        );
-        return;
-      }
-      const draft = Object.fromEntries(
-        fields.map((field) => [
-          field.key,
-          Object.hasOwn(values, field.key)
-            ? fieldType(field.schema) === "json"
-              ? JSON.stringify(values[field.key], null, 2)
-              : String(values[field.key])
-            : "",
-        ]),
-      );
-      if (
-        Object.values(values).some((value) => value === null || value === "")
-      ) {
-        toast("包含 null 或空字符串时，请保留 JSON 模式，以保留精确参数。");
-        return;
-      }
-      state.drafts.set(tool.name, draft);
-    } catch (error) {
-      showError(error);
-      return;
-    }
+    state.formError = "";
+    state.errors = [];
   }
-  state.formMode = mode;
-  state.formError = "";
-  state.errors = [];
   renderWorkPanel(document.querySelector("#work-panel"));
 }
-function renderField(field, values) {
+function renderField(field, values, tool) {
   const wrapper = el("div", "field");
   const label = el(
     "label",
@@ -962,7 +884,7 @@ function renderField(field, values) {
   input.value = values[field.key] ?? "";
   input.autocomplete = "off";
   input.addEventListener("input", () => {
-    values[field.key] = input.value;
+    state.drafts.setField(tool, field.key, input.value);
   });
   const error = state.errors.find((item) => item.key === field.key);
   if (error) {
@@ -984,7 +906,7 @@ function renderField(field, values) {
           : "file";
         const path = await api.pickPath({ kind, title: label.textContent });
         if (path) {
-          values[field.key] = path;
+          state.drafts.setField(tool, field.key, path);
           input.value = path;
         }
       },
@@ -1018,21 +940,16 @@ async function submitTool() {
   state.formError = "";
   state.errors = [];
   try {
-    if (state.formMode === "json" || !schemaFields(tool.inputSchema).length)
-      args = readJsonArguments(state.rawDrafts.get(tool.name) ?? "{}");
-    else {
-      const parsed = readFormArguments(
-        schemaFields(tool.inputSchema),
-        state.drafts.get(tool.name),
-      );
-      if (parsed.errors.length) {
-        state.errors = parsed.errors;
-        state.formError = "还有必填参数或格式需要检查。";
-        renderWorkPanel(document.querySelector("#work-panel"));
-        return;
-      }
-      args = parsed.arguments;
+    const parsed = state.drafts.readArguments(tool);
+    if (!parsed.ok) {
+      state.errors = parsed.errors;
+      state.formError = parsed.errors
+        .map((error) => (error.key ? error.key + ": " : "") + error.message)
+        .join("\n");
+      renderWorkPanel(document.querySelector("#work-panel"));
+      return;
     }
+    args = parsed.arguments;
     const task = await api.submit({ tool: tool.name, arguments: args });
     updateTask(task);
     state.activeTaskId = task.id;

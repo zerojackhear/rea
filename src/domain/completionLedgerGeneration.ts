@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 
 import canonicalize from "canonicalize";
 import { z } from "zod";
+import { utcDateTimeSchema } from "./offsetDateTime.js";
 
 import { IDENTIFIER_PATTERN } from "./stringPatterns.js";
 
@@ -40,7 +41,7 @@ const verifierRunSchema = z
     process_lineage: z.discriminatedUnion("status", [
       z.strictObject({
         status: z.literal("verified"),
-        observed_at: z.iso.datetime(),
+        observed_at: utcDateTimeSchema,
         launcher_pid: z.number().int().positive(),
         launcher_parent_pid: z.number().int().nonnegative(),
         process_group_id: z.number().int().positive(),
@@ -54,7 +55,7 @@ const verifierRunSchema = z
       }),
       z.strictObject({
         status: z.literal("unavailable"),
-        observed_at: z.iso.datetime(),
+        observed_at: utcDateTimeSchema,
         launcher_pid: z.number().int().positive(),
         launcher_parent_pid: z.number().int().nonnegative(),
         process_group_id: z.number().int().positive().nullable(),
