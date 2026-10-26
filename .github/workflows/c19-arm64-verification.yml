@@ -1,0 +1,97 @@
+name: c19 isolated ARM64 producer verification
+on:
+  push:
+    branches: [codex/c19-arm64-runtime-20261026]
+    paths: [.github/workflows/c19-arm64-verification.yml, scripts/verification/arm64-cloud/**]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: c19-arm64-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  HUSKY: '0'
+  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+  TURBO_TELEMETRY_DISABLED: '1'
+  TURBO_CACHE: local:rw
+jobs:
+  runtime:
+    if: github.repository == 'zerojackhear/rea' && github.ref == 'refs/heads/codex/c19-arm64-runtime-20261026'
+    name: native OS / ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04-arm
+            shell: bash
+            label: linux
+          - runner: windows-11-arm
+            shell: pwsh
+            label: windows
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          path: validation
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: c19c2d6723fb92548b0c8a1ed0696d721a80aae6
+          path: runtime
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.18.0
+          architecture: arm64
+      - name: Install and build the exact c19 runtime
+        run: node validation/scripts/verification/arm64-cloud/install-runtime.mjs --root runtime --out outputs/runtime-install
+      - name: Produce new native ARM64 Go and Rust artifacts
+        run: node validation/scripts/verification/arm64-cloud/bootstrap-arm64.mjs --root runtime --fixtures validation/scripts/verification/arm64-cloud/fixtures --artifacts-dir outputs/artifacts --out outputs/bootstrap.json
+      - name: Inspect and execute the same artifacts
+        run: node validation/scripts/verification/arm64-cloud/verify-arm64.mjs --root runtime --artifacts-dir outputs/artifacts --out outputs/public --bootstrap-receipt outputs/bootstrap.json
+      - name: Retain samples, source, raw output and receipts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: c19-arm64-${{ matrix.label }}-${{ github.run_attempt }}
+          retention-days: 30
+          if-no-files-found: error
+          path: |
+            outputs/*.json
+            outputs/runtime-install/*.json
+            outputs/runtime-install/*.log
+            outputs/artifacts/go-fixture*
+            outputs/artifacts/rust-fixture*
+            outputs/artifacts/bootstrap-logs/
+            outputs/artifacts/bootstrap-downloads/*.json
+            outputs/artifacts/bootstrap-downloads/*.toml
+            outputs/artifacts/bootstrap-downloads/*.sha256
+            outputs/public/
+            validation/scripts/verification/arm64-cloud/fixtures/
+  crt-observation:
+    if: github.repository == 'zerojackhear/rea' && github.ref == 'refs/heads/codex/c19-arm64-runtime-20261026'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          path: validation
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.18.0
+          architecture: arm64
+      - name: Observe fixed manifest URL and enforce its pinned integrity
+        run: node validation/scripts/verification/arm64-cloud/observe-crt.mjs outputs/crt
+      - name: Retain complete or partial transfer evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: c19-crt-cloud-${{ github.run_attempt }}
+          path: outputs/crt/
+          retention-days: 30
+          if-no-files-found: error

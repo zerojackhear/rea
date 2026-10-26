@@ -1,0 +1,7 @@
+[package]
+name = "local-protocol"
+version = "0.2.3"
+edition = "2021"
+
+[dependencies]
+local-bytes = { path = "../local-bytes", version = "1.4.2" }

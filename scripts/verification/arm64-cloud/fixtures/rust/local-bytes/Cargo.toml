@@ -1,0 +1,4 @@
+[package]
+name = "local-bytes"
+version = "1.4.2"
+edition = "2021"
