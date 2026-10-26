@@ -68,7 +68,7 @@ async function fixtureSnapshot(directory) {
   await visit(directory);
   return records;
 }
-async function command(label, file, commandArgs, { cwd = root, timeout = 60_000, allowFailure = false, environment = env } = {}) {
+async function command(label, file, commandArgs, { cwd = root, timeout = 60_000, allowFailure = false, environment = env, windowsVerbatimArguments = false } = {}) {
   const name = `${String(++sequence).padStart(3, '0')}-${label}`;
   const item = { label, executable: file, args: commandArgs, cwd, timeout_ms: timeout, started_at: new Date().toISOString(), stdout: path.join(logs, `${name}.stdout.log`), stderr: path.join(logs, `${name}.stderr.log`), status: 'running' };
   report.commands.push(item);
@@ -76,7 +76,7 @@ async function command(label, file, commandArgs, { cwd = root, timeout = 60_000,
   // Persist raw output with a bound; never persist the inherited environment.
   let stdout = Buffer.alloc(0), stderr = Buffer.alloc(0), bytes = 0;
   const started = Date.now();
-  const child = spawn(file, commandArgs, { cwd, env: environment, shell: false, windowsHide: true, detached: !windows, stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawn(file, commandArgs, { cwd, env: environment, shell: false, windowsHide: true, windowsVerbatimArguments, detached: !windows, stdio: ['ignore', 'pipe', 'pipe'] });
   let forcedReason;
   const terminate = (reason) => {
     if (forcedReason) return;
@@ -107,7 +107,7 @@ async function command(label, file, commandArgs, { cwd = root, timeout = 60_000,
   await Promise.all([writeFile(item.stdout, stdout), writeFile(item.stderr, stderr)]);
   await writeFile(path.join(logs, `${name}.command.json`), `${JSON.stringify(item, null, 2)}\n`);
   await save();
-  if (!allowFailure && (result.code !== 0 || forcedReason)) throw new Error(`${label}: ${forcedReason ?? result.error ?? `exit ${result.code}`} (see ${item.stderr})`);
+  if (!allowFailure && (result.code !== 0 || forcedReason)) { console.error(`[${label}] stdout tail:\n${stdout.toString('utf8').slice(-16000)}\nstderr tail:\n${stderr.toString('utf8').slice(-16000)}`); throw new Error(`${label}: ${forcedReason ?? result.error ?? `exit ${result.code}`} (see ${item.stderr})`); }
   return { ...result, stdout: stdout.toString('utf8'), stderr: stderr.toString('utf8'), log: item };
 }
 async function download(label, url, { limit = 16 * 1024 * 1024, timeout = 120_000 } = {}) {
@@ -185,8 +185,8 @@ async function configureLinker() {
   ensure(await exists(vsDevCmd), 'VS developer command script is missing');
   // set NAME emits matching names only. Never log `set` without a whitelist.
   const keys = ['VCToolsInstallDir', 'WindowsSdkDir', 'WindowsSDKVersion', 'VSCMD_ARG_TGT_ARCH'];
-  const setup = `call "${vsDevCmd}" -arch=arm64 -host_arch=arm64 >nul && ${keys.map((key) => `set ${key}`).join(' & ')}`;
-  const vars = await command('vs-arm64-environment', process.env.ComSpec ?? 'cmd.exe', ['/d', '/s', '/c', setup]);
+  const setup = `call "${vsDevCmd}" -arch=arm64 -host_arch=arm64 -no_logo && (${keys.map((key) => `set ${key}`).join(' & ')})`;
+  const vars = await command('vs-arm64-environment', process.env.ComSpec ?? 'cmd.exe', ['/d', '/s', '/c', setup], { windowsVerbatimArguments: true, environment: { ...env, VSCMD_DEBUG: '0', VSCMD_SKIP_SENDTELEMETRY: '1' } });
   for (const line of vars.stdout.split(/\r?\n/)) {
     const split = line.indexOf('=');
     const key = keys.find((name) => name.toLowerCase() === line.slice(0, split).toLowerCase());
