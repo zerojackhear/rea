@@ -1,0 +1,35 @@
+name: c19 second CRT manifest pair observation
+on:
+  push:
+    branches: [codex/c19-arm64-runtime-20261026]
+    paths:
+      - .github/workflows/c19-crt-current-manifest.yml
+      - scripts/verification/crt-current-manifest.mjs
+permissions:
+  contents: read
+concurrency:
+  group: c19-crt-current-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  current-manifest:
+    if: github.repository == 'zerojackhear/rea' && github.ref == 'refs/heads/codex/c19-arm64-runtime-20261026'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.18.0
+          architecture: arm64
+      - name: Observe the second fixed manifest pair once
+        run: node scripts/verification/crt-current-manifest.mjs outputs/crt-current-manifest
+      - name: Retain complete or partial raw bytes and receipt
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: c19-crt-current-${{ github.run_id }}-${{ github.run_attempt }}
+          path: outputs/crt-current-manifest/
+          retention-days: 30
+          if-no-files-found: error
