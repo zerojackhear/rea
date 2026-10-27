@@ -42,7 +42,14 @@ export default {
       },
       {
         kind: "declaration",
-        name: "createRizinCommandTimeoutError",
+        name: "snapshot",
+        withinBlockWithBinding: "deadline",
+      },
+      {
+        kind: "guard",
+        owner: "RizinDebugSessionManager",
+        method: "execute",
+        condition: 'interruption?.kind === "timeout"',
       },
       {
         kind: "declaration",
