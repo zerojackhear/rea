@@ -340,6 +340,11 @@ export class ProviderProcessSupervisor {
     return { code: exit.code, signal: exit.signal };
   }
 
+  /** Whether the process owner observed output closure, separately from exit. */
+  observedOutputClose(): boolean {
+    return this.#outputClosed;
+  }
+
   /** Latest retained output and exit observation, with explicit configured truncation. */
   snapshot(): ProviderProcessSnapshot {
     const outputIncomplete = this.launch.process.outputIncomplete === true;
@@ -377,11 +382,15 @@ export class ProviderProcessSupervisor {
   }
 
   /** Wait until output streams close; WindowsOwnedProcess closes only after its whole Job Object settles. */
-  async waitForOutputClose(timeoutMs: number): Promise<boolean> {
+  async waitForOutputClose(
+    timeoutMs: number,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
     return waitForProcessEvent(
       this.#outputClosed,
       this.#outputClose.promise,
       timeoutMs,
+      signal,
     );
   }
 
@@ -680,17 +689,25 @@ const waitForProcessEvent = async (
   observed: boolean,
   event: Promise<unknown>,
   timeoutMs: number,
+  signal?: AbortSignal,
 ): Promise<boolean> => {
   if (observed) return true;
+  if (signal?.aborted === true) return false;
   let timer: NodeJS.Timeout | undefined;
+  let onAbort: (() => void) | undefined;
   try {
     return await Promise.race([
       event.then(() => true),
       new Promise<boolean>((resolve) => {
         timer = setTimeout(() => resolve(false), Math.max(0, timeoutMs));
+        if (signal !== undefined) {
+          onAbort = () => resolve(false);
+          signal.addEventListener("abort", onAbort, { once: true });
+        }
       }),
     ]);
   } finally {
     if (timer !== undefined) clearTimeout(timer);
+    if (onAbort !== undefined) signal?.removeEventListener("abort", onAbort);
   }
 };
