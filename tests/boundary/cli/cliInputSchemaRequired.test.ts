@@ -3,6 +3,7 @@ import { Cli, z } from "incur";
 import { describe, expect, it } from "vitest";
 
 import { createCli } from "../../../src/cli.js";
+import { presentOmittableDefaults } from "../../../src/cli/omittableDefaults.js";
 import { createCliInventory } from "../../../scripts/lib/catalog-cli.mjs";
 
 type CliInstance = ReturnType<typeof createCli>;
@@ -64,6 +65,46 @@ const omissionRejected = (schema: z.ZodObject | undefined): string[] =>
     .sort();
 
 describe("CLI advertised input schemas", () => {
+  it("presents default-filled inputs without evaluating defaults or weakening required inputs", () => {
+    let calls = 0;
+    const cli = Cli.create({ name: "omission-probe", version: "0" });
+    cli.command("probe", {
+      options: z.object({
+        filled: z.number().default(() => {
+          calls += 1;
+          return 7;
+        }),
+        required: z.string(),
+        optional: z.string().optional(),
+      }),
+      run: () => undefined,
+    });
+    presentOmittableDefaults(cli);
+    expect(calls).toBe(0);
+    const command = registeredCommands.get(cli)?.get("probe");
+    if (
+      command === undefined ||
+      !("options" in command) ||
+      !(command.options instanceof z.ZodObject)
+    ) {
+      throw new Error("Expected the registered probe options");
+    }
+    const schema = command.options;
+    expect(schema.shape.filled?._zod.optout).toBe("optional");
+    expect(schema.shape.required?._zod.optin).toBeUndefined();
+    expect(schema.shape.optional?._zod.optout).toBe("optional");
+    expect(schema.parse({ required: "selected" })).toEqual({
+      filled: 7,
+      required: "selected",
+    });
+    expect(calls).toBe(1);
+    expect(schema.safeParse({ filled: 7 }).success).toBe(false);
+    expect(
+      schema.safeParse({ filled: 7, required: "selected", optional: 42 })
+        .success,
+    ).toBe(false);
+  });
+
   it("require exactly the inputs whose omission the parser rejects", async () => {
     const cli = createCli({});
     const mismatches: string[] = [];

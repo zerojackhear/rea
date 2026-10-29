@@ -1,0 +1,10 @@
+{
+  "name": "rea-desktop",
+  "productName": "REA Desktop",
+  "version": "0.1.0",
+  "description": "Local REA investigation workspace for Windows",
+  "private": true,
+  "type": "module",
+  "main": "main.mjs",
+  "license": "MIT"
+}

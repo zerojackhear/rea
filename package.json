@@ -304,7 +304,10 @@
     "docs:prepare": "node scripts/generate-package-metadata.mjs && turbo run artifacts:product-catalog artifacts:managed-evidence artifacts:error-schema",
     "verify:web:qlog": "npm run build:cached && node scripts/verify-qlog-captures.mjs",
     "licenses:generate": "node scripts/generate-third-party-inventory.mjs",
-    "licenses:check": "node scripts/generate-third-party-inventory.mjs --check"
+    "licenses:check": "node scripts/generate-third-party-inventory.mjs --check",
+    "desktop:start": "node apps/desktop/launch.mjs",
+    "desktop:package": "node apps/desktop/package.mjs",
+    "desktop:test": "node --test apps/desktop/*.test.mjs"
   },
   "lint-staged": {
     "*.{cjs,cts,js,jsx,mjs,mts,ts,tsx}": [
@@ -353,7 +356,7 @@
     "write-file-atomic": "7.0.0",
     "ws": "8.21.0",
     "yaml": "2.9.0",
-    "zod": "4.4.3"
+    "zod": "4.6.6"
   },
   "overrides": {
     "typed-rest-client": {

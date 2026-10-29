@@ -1,7 +1,7 @@
 REA third-party npm runtime copyright, license and NOTICE texts
 Collected from integrity-verified locked npm archives. Release-specific supplements and upstream notice gaps are identified in their entries.
 External engines are separately obtained; see THIRD_PARTY_NOTICES.md.
-Runtime dependency fingerprint (SHA-256): 131100b2e1e6ad5e55b10a0baf4be2d7a0838fd724fb307b9bafd73446b0d3ec
+Runtime dependency fingerprint (SHA-256): 8e13caf41f60649e26ae6a73677399af50dd08ca2c9cc5b1c8380f8fc1a86677
 
 ===== @babel/helper-string-parser@8.0.6 =====
 Declared license: MIT
@@ -3664,10 +3664,10 @@ FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
 
-===== fast-uri@3.1.8 =====
+===== fast-uri@3.1.9 =====
 Declared license: BSD-3-Clause
-Archive: https://registry.npmjs.org/fast-uri/-/fast-uri-3.1.8.tgz
-Integrity: sha512-GZMtZUTNRpOVIECoXwLNZS5xUGE+mVNbTB8h/7Rwh2TFWcBQiPzTgyZi05BF9UMZKkLJv8XBRJTlU7zg8+ZfMg==
+Archive: https://registry.npmjs.org/fast-uri/-/fast-uri-3.1.9.tgz
+Integrity: sha512-hS/0Wt3Ya043oKXs0sIxrMpKQITXhMLIrVAKKXi4gozGC9v7YRWVnXIZzjNPTO02M9BdxLCWqK1yRXgNziVyJQ==
 Scope: npm runtime dependency, including optional platform packages.
 
 --- package/LICENSE ---
@@ -6999,10 +6999,10 @@ TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF
 THIS SOFTWARE.
 
 
-===== zod@4.4.3 =====
+===== zod@4.6.6 =====
 Declared license: MIT
-Archive: https://registry.npmjs.org/zod/-/zod-4.4.3.tgz
-Integrity: sha512-ytENFjIJFl2UwYglde2jchW2Hwm4GJFLDiSXWdTrJQBIN9Fcyp7n4DhxJEiWNAJMV1/BqWfW/kkg71UDcHJyTQ==
+Archive: https://registry.npmjs.org/zod/-/zod-4.6.6.tgz
+Integrity: sha512-4UmzQUF5fxvfcYHlbjBmejU+w+hbDnWFx4aS8kBx7nPBHcO2SqPbpAG8snbdg+Xse4pRefR98hgjFgIMCI/UhA==
 Scope: npm runtime dependency, including optional platform packages.
 
 --- package/LICENSE ---
