@@ -13,6 +13,7 @@ import {
 import type { AnalysisError } from "../domain/analysisErrorBase.js";
 import { err, ok, type Result } from "../domain/result.js";
 import type { GhidraInstallationInspection } from "./GhidraInstallation.js";
+import { ghidraPspHostUnsupportedReason } from "./GhidraPspProfile.js";
 import { parseGhidraJavaProperties } from "./GhidraJavaProperties.js";
 
 /** Installed processor code and data, distinct from REA's analysis-extension ABI. */
@@ -176,14 +177,15 @@ export const resolveGhidraPspExtension = async (
   if (signal?.aborted)
     return err(new AnalysisCancelledError("resolve_analysis_profile"));
   try {
-    if (
-      installation.status !== "available" ||
-      installation.platform !== "linux" ||
-      installation.architecture !== "x64"
-    )
+    if (installation.status !== "available")
       throw new Error(
-        "The initial PSP profile requires a supported Linux x64 Ghidra installation.",
+        "The PSP profile requires an available Ghidra installation.",
       );
+    const hostReason = ghidraPspHostUnsupportedReason(
+      installation.platform,
+      installation.architecture,
+    );
+    if (hostReason !== null) throw new Error(hostReason);
     const root = join(
       await realpath(installation.installDir),
       "Ghidra",

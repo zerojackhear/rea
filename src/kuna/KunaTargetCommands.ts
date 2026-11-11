@@ -1,4 +1,4 @@
-import { basename, join } from "node:path";
+import { basename, join, toNamespacedPath } from "node:path";
 import { realpath } from "node:fs/promises";
 
 import type { AnalysisError } from "../domain/analysisErrorBase.js";
@@ -201,7 +201,10 @@ export class KunaTargetCommands {
           );
         }
         await prepareProcessOwnershipInspection(this.lifetime.signal);
-        return ok({ root, input: await realpath(input) });
+        // Rust canonicalize reports Windows verbatim paths in call graphs and
+        // xrefs; strings reports the supplied spelling. Give every producer
+        // the same canonical path once, keeping exact reply identity checks.
+        return ok({ root, input: toNamespacedPath(await realpath(input)) });
       } catch (cause: unknown) {
         await this.#release(root);
         throw cause;

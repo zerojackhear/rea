@@ -54,7 +54,7 @@ import {
 import { pwntoolsInputBytes } from "./PwntoolsInputLimit.js";
 
 const HOST_REQUIREMENT =
-  "The initial real-verified pwntools artifact profile supports Linux x64 only.";
+  "The pwntools artifact profile requires native Windows x64 or Linux x64.";
 
 /** Owned launcher seam shared by the offline pwntools artifact adapters. */
 export type PwntoolsLauncher = NonNullable<
@@ -221,7 +221,10 @@ export class PwntoolsDecoder<
       );
     try {
       if (options?.signal?.aborted) throw new AnalysisCancelledError(OPERATION);
-      if (process.platform !== "linux" || process.arch !== "x64")
+      if (
+        (process.platform !== "linux" && process.platform !== "win32") ||
+        process.arch !== "x64"
+      )
         throw new AnalysisCapabilityUnavailableError(
           this.identity.id,
           OPERATION,
@@ -286,7 +289,15 @@ export class PwntoolsDecoder<
       });
       await writeFile(
         requestPath,
-        JSON.stringify({ snapshot_path: snapshotPath, reply_path: replyPath }),
+        JSON.stringify({
+          snapshot_path: snapshotPath,
+          reply_path: replyPath,
+          // Native spawn refuses to proceed unless its Job Object readback
+          // matches this value. The bridge cannot query through inner venv jobs.
+          ...(process.platform === "win32"
+            ? { windows_job_memory_bytes: PWNTOOLS_LIMITS.addressSpaceBytes }
+            : {}),
+        }),
         { flag: "wx", mode: 0o600 },
       );
       const execution = await this.#runCommand(
@@ -299,6 +310,12 @@ export class PwntoolsDecoder<
             requestPath,
           ],
           cwd: root.path,
+          ...(process.platform === "win32"
+            ? {
+                memoryLimitBytes: PWNTOOLS_LIMITS.addressSpaceBytes,
+                env: { TEMP: root.path, TMP: root.path, TMPDIR: root.path },
+              }
+            : {}),
           // Caller-selected Python launchers can exec through prlimit or a
           // shell wrapper. Keep parent/group/run-token ownership across exec.
           expectedCommand: null,

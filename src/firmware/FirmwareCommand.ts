@@ -7,6 +7,7 @@ import {
   AnalysisCancelledError,
   AnalysisTimeoutError,
   AnalysisOutputError,
+  AnalysisResourceConstraintError,
 } from "../domain/analysisErrorCore.js";
 import { ProviderAdapterError } from "../domain/providerAdapterError.js";
 import { ProviderCleanupError } from "../domain/providerCleanupError.js";
@@ -49,14 +50,14 @@ export const resolveFirmwareCommand = async (
     engine === "binwalk" ? "REA_BINWALK_COMMAND" : "REA_UNBLOB_COMMAND";
   const configured = environment[variable];
   if (
-    process.platform !== "linux" ||
+    (process.platform !== "linux" && process.platform !== "win32") ||
     configured === undefined ||
     !isAbsolute(configured)
   )
     throw firmwareToolUnavailable(
       engine,
       operation,
-      `This integration requires Linux and an absolute ${variable} path to the caller-supplied tool`,
+      `This integration requires Windows or Linux and an absolute ${variable} path to the caller-supplied tool`,
     );
   const command = await realpath(configured).catch((cause: unknown) => {
     throw firmwareToolUnavailable(
@@ -78,6 +79,7 @@ export const resolveFirmwareCommand = async (
       `${variable} is not a readable executable regular file: ${command}: ${cause instanceof Error ? cause.message : String(cause)}`,
     );
   }
+  if (process.platform === "win32") return { command, limiter: null, sha256 };
   const limiter =
     environment.REA_FIRMWARE_PRLIMIT_COMMAND ?? "/usr/bin/prlimit";
   if (!isAbsolute(limiter))
@@ -105,12 +107,13 @@ export const runFirmwareCommand = async (context: {
   engine: string;
   operation: string;
   command: string;
-  limiter: string;
+  limiter: string | null;
   args: readonly string[];
   cwd: string;
   environment: Readonly<Record<string, string | undefined>>;
   signal: AbortSignal;
   launcher?: FirmwareLauncher;
+  appContainerRuntime?: object;
   outputBudget?: { root: string; bytes: number; entries: number };
   acceptReportedExtractionFailure?: boolean;
   retainCleanup(supervisor: ProviderProcessSupervisor): void;
@@ -119,23 +122,38 @@ export const runFirmwareCommand = async (context: {
   signal.throwIfAborted();
   const runId = `rea-firmware-${randomUUID()}`;
   const spawned = await (context.launcher ?? spawnOwnedProviderProcess)({
-    command: context.limiter,
-    arguments: [
-      `--as=${FIRMWARE_LIMITS.addressSpaceBytes}`,
-      `--fsize=${context.outputBudget?.bytes ?? FIRMWARE_LIMITS.reportBytes}`,
-      "--core=0",
-      "--cpu=120",
-      "--",
-      context.command,
-      ...context.args,
-    ],
-    expectedCommand: null,
+    ...(context.limiter === null
+      ? {
+          command: context.command,
+          arguments: context.args,
+          memoryLimitBytes: FIRMWARE_LIMITS.addressSpaceBytes,
+        }
+      : {
+          command: context.limiter,
+          arguments: [
+            `--as=${FIRMWARE_LIMITS.addressSpaceBytes}`,
+            `--fsize=${context.outputBudget?.bytes ?? FIRMWARE_LIMITS.reportBytes}`,
+            "--core=0",
+            "--cpu=120",
+            "--",
+            context.command,
+            ...context.args,
+          ],
+          expectedCommand: null,
+        }),
     runId,
     cwd: context.cwd,
-    hostEnvironment: context.environment,
+    hostEnvironment:
+      context.appContainerRuntime === undefined ? context.environment : {},
+    ...(context.appContainerRuntime === undefined
+      ? {}
+      : { appContainerRuntime: context.appContainerRuntime }),
     signal,
     env: {
       TMPDIR: context.cwd,
+      ...(process.platform === "win32"
+        ? { TEMP: context.cwd, TMP: context.cwd }
+        : {}),
       OMP_NUM_THREADS: "1",
       OPENBLAS_NUM_THREADS: "1",
       RAYON_NUM_THREADS: "1",
@@ -159,6 +177,21 @@ export const runFirmwareCommand = async (context: {
     },
   );
   const checkDiagnostics = () => {
+    const observed = supervisor.snapshot();
+    if (observed.memoryLimitReached === true)
+      throw new AnalysisResourceConstraintError(
+        operation,
+        "memory",
+        "Firmware tool reached its owned Windows Job Object memory limit.",
+        { process_memory_limit_bytes: FIRMWARE_LIMITS.addressSpaceBytes },
+        {
+          capturedOutput: {
+            stdout: observed.stdout.text,
+            stderr: observed.stderr.text,
+            truncated: observed.diagnosticTruncated ?? false,
+          },
+        },
+      );
     if (diagnosticTruncated) {
       const snapshot = supervisor.snapshot();
       throw new AnalysisOutputError(
@@ -240,7 +273,14 @@ export const runFirmwareCommand = async (context: {
     signal: snapshot.signal ?? null,
     command: context.command,
     args: [...context.args],
-    resource_limiter: context.limiter,
+    resource_limiter:
+      context.limiter === null
+        ? {
+            kind: "windows-job-object",
+            scope: "owned-process-tree",
+            memory_limit_bytes: FIRMWARE_LIMITS.addressSpaceBytes,
+          }
+        : context.limiter,
   };
 };
 

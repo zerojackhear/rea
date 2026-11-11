@@ -1,0 +1,185 @@
+--- a/librz/io/p/io_debug.c
++++ b/librz/io/p/io_debug.c
+@@ -107,18 +107,117 @@
+ 	LPTSTR cmdline;
+ 	PROCESS_INFORMATION *pi;
+ 	DWORD flags;
++	const RzRunProfile *stdio_profile;
++	BOOL exit_kills;
+ };
+ 
++static HANDLE open_existing_debug_output(const char *path) {
++	if (!path || !*path) {
++		SetLastError(ERROR_INVALID_PARAMETER);
++		return INVALID_HANDLE_VALUE;
++	}
++	LPWSTR selected = rz_utf8_to_utf16(path);
++	if (!selected) {
++		SetLastError(ERROR_NOT_ENOUGH_MEMORY);
++		return INVALID_HANDLE_VALUE;
++	}
++	SECURITY_ATTRIBUTES security = { sizeof(security), NULL, TRUE };
++	HANDLE file = CreateFileW(selected, FILE_APPEND_DATA | FILE_READ_ATTRIBUTES,
++		FILE_SHARE_READ | FILE_SHARE_WRITE, &security, OPEN_EXISTING,
++		FILE_FLAG_OPEN_REPARSE_POINT, NULL);
++	free(selected);
++	if (file == INVALID_HANDLE_VALUE) {
++		return file;
++	}
++	FILE_ATTRIBUTE_TAG_INFO attributes;
++	wchar_t filesystem[32];
++	if (GetFileType(file) != FILE_TYPE_DISK ||
++		!GetFileInformationByHandleEx(file, FileAttributeTagInfo, &attributes, sizeof(attributes)) ||
++		(attributes.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) ||
++		!GetVolumeInformationByHandleW(file, NULL, 0, NULL, NULL, NULL, filesystem, 32) ||
++		wcscmp(filesystem, L"NTFS")) {
++		CloseHandle(file);
++		SetLastError(ERROR_NOT_SUPPORTED);
++		return INVALID_HANDLE_VALUE;
++	}
++	return file;
++}
++
+ static int __createprocess_wrap(void *params) {
+-	STARTUPINFO si = { 0 };
+ 	// TODO: Add DEBUG_PROCESS to support child process debugging
+ 	struct __createprocess_params *p = params;
+-	return CreateProcess(p->appname, p->cmdline, NULL, NULL, FALSE,
+-		p->flags, NULL, NULL, &si, p->pi);
++	STARTUPINFOEX si = { 0 };
++	si.StartupInfo.cb = sizeof(STARTUPINFO);
++	HANDLE handles[3] = { INVALID_HANDLE_VALUE, INVALID_HANDLE_VALUE, INVALID_HANDLE_VALUE };
++	SECURITY_ATTRIBUTES security = { sizeof(security), NULL, TRUE };
++	SIZE_T bytes = 0;
++	BOOL result = FALSE;
++	DWORD failure = ERROR_SUCCESS;
++	BOOL attributes_initialized = FALSE;
++	if (p->stdio_profile) {
++		handles[0] = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
++			&security, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
++		handles[1] = open_existing_debug_output(p->stdio_profile->_stdout);
++		handles[2] = open_existing_debug_output(p->stdio_profile->_stderr);
++		if (handles[0] == INVALID_HANDLE_VALUE || handles[1] == INVALID_HANDLE_VALUE || handles[2] == INVALID_HANDLE_VALUE) {
++			goto done;
++		}
++		InitializeProcThreadAttributeList(NULL, 1, 0, &bytes);
++		si.lpAttributeList = HeapAlloc(GetProcessHeap(), 0, bytes);
++		if (!si.lpAttributeList) {
++			SetLastError(ERROR_NOT_ENOUGH_MEMORY);
++			goto done;
++		}
++		if (!InitializeProcThreadAttributeList(si.lpAttributeList, 1, 0, &bytes)) {
++			goto done;
++		}
++		attributes_initialized = TRUE;
++		if (!UpdateProcThreadAttribute(si.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
++			handles, sizeof(handles), NULL, NULL)) {
++			goto done;
++		}
++		si.StartupInfo.cb = sizeof(si);
++		si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
++		si.StartupInfo.hStdInput = handles[0];
++		si.StartupInfo.hStdOutput = handles[1];
++		si.StartupInfo.hStdError = handles[2];
++	}
++	result = CreateProcess(p->appname, p->cmdline, NULL, NULL, p->stdio_profile != NULL,
++		p->flags | (p->stdio_profile ? EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW : 0),
++		NULL, NULL, &si.StartupInfo, p->pi);
++	if (result && !DebugSetProcessKillOnExit(p->exit_kills)) {
++		// The initial debug event has not been continued, so this new inferior
++		// has not executed target instructions and remains owned by this launch.
++		failure = GetLastError();
++		TerminateProcess(p->pi->hProcess, 1);
++		CloseHandle(p->pi->hThread);
++		CloseHandle(p->pi->hProcess);
++		result = FALSE;
++	}
++done:
++	if (!failure) {
++		failure = GetLastError();
++	}
++	if (attributes_initialized) {
++		DeleteProcThreadAttributeList(si.lpAttributeList);
++	}
++	if (si.lpAttributeList) {
++		HeapFree(GetProcessHeap(), 0, si.lpAttributeList);
++	}
++	for (size_t i = 0; i < 3; i++) {
++		if (handles[i] != INVALID_HANDLE_VALUE) {
++			CloseHandle(handles[i]);
++		}
++	}
++	SetLastError(failure);
++	return result;
+ }
+ 
+ static int fork_and_ptraceme(RzIO *io, int bits, const char *cmd) {
+ 	RzCore *core = io->corebind.core;
++	if (!io->corebind.cfggeti) {
++		return -1;
++	}
+ 	PROCESS_INFORMATION pi;
+ 	STARTUPINFO si = { 0 };
+ 	si.cb = sizeof(si);
+@@ -129,13 +228,36 @@
+ 	setup_tokens();
+ 	char *_cmd = io->args ? rz_str_appendf(rz_str_dup(cmd), " %s", io->args) : rz_str_dup(cmd);
+ 	char **argv = rz_str_argv(_cmd, NULL);
+-	char *cmdline = NULL;
+-	// We need to build a command line with quoted argument and escaped quotes
++	free(_cmd);
++	if (!argv || !argv[0]) {
++		rz_str_argv_free(argv);
++		return -1;
++	}
++	// Use the existing CRT-aware owner of Windows argv encoding.
+ 	int i = 0;
+ 	while (argv[i]) {
+ 		rz_str_arg_unescape(argv[i]);
+-		cmdline = rz_str_appendf(cmdline, "\"%s\" ", argv[i]);
+ 		i++;
++	}
++	char *cmdline = rz_str_format_msvc_argv(i, (const char **)argv);
++	if (!cmdline) {
++		rz_str_argv_free(argv);
++		return -1;
++	}
++	RzRunProfile *stdio_profile = NULL;
++	if (io->corebind.cfggeti(core, "dbg.windows.stdio")) {
++		stdio_profile = rz_run_new(NULL);
++		bool parsed = stdio_profile && (RZ_STR_ISNOTEMPTY(io->runprofile)
++			? rz_run_parsefile(stdio_profile, io->runprofile)
++			: RZ_STR_ISNOTEMPTY(io->envprofile) && rz_run_parse(stdio_profile, io->envprofile));
++		if (!parsed || !RZ_STR_ISNOTEMPTY(stdio_profile->_stdout) || !RZ_STR_ISNOTEMPTY(stdio_profile->_stderr) ||
++			core->dbg->create_new_console) {
++			RZ_LOG_ERROR("Windows durable stdio requires existing stdout/stderr files and dbg.create_new_console=false\n");
++			rz_run_free(stdio_profile);
++			free(cmdline);
++			rz_str_argv_free(argv);
++			return -1;
++		}
+ 	}
+ 
+ 	LPTSTR appname_ = rz_sys_conv_utf8_to_win(argv[0]);
+@@ -143,17 +265,20 @@
+ 	DWORD flags = DEBUG_ONLY_THIS_PROCESS;
+ 	flags |= core->dbg->create_new_console ? CREATE_NEW_CONSOLE : 0;
+ 	free(cmdline);
+-	struct __createprocess_params p = { appname_, cmdline_, &pi, flags };
++	struct __createprocess_params p = { appname_, cmdline_, &pi, flags, stdio_profile,
++		io->corebind.cfggeti(core, "dbg.exitkills") != 0 };
+ 	W32DbgWInst *wrap = (W32DbgWInst *)rz_io_get_w32dbg_wrap(io);
+ 	wrap->params.type = W32_CALL_FUNC;
+ 	wrap->params.func.func = __createprocess_wrap;
+ 	wrap->params.func.user = &p;
+ 	w32dbg_wrap_wait_ret(wrap);
++	rz_run_free(stdio_profile);
+ 	if (!w32dbgw_ret(wrap)) {
+ 		w32dbgw_err(wrap);
+ 		rz_sys_perror("fork_and_ptraceme/CreateProcess");
+ 		free(appname_);
+ 		free(cmdline_);
++		rz_str_argv_free(argv);
+ 		return -1;
+ 	}
+ 	CloseHandle(pi.hThread);

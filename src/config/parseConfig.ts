@@ -47,6 +47,9 @@ export const parseConfig = (
   if (!parsed.ok) return parsed;
   const env = parsed.value;
   return ok({
+    ...(env.REA_MCP_REVIEW_AFTER_ANALYSIS === undefined
+      ? {}
+      : { mcpReviewAfterAnalysis: env.REA_MCP_REVIEW_AFTER_ANALYSIS }),
     ...(env.REA_MCP_MAX_RESPONSE_BYTES === undefined
       ? {}
       : { mcpMaxResponseBytes: env.REA_MCP_MAX_RESPONSE_BYTES }),

@@ -20,7 +20,7 @@ export const WAKARU_PROVIDER_IDENTITY = {
   version: WAKARU_RELEASE.version,
 } as const;
 
-/** Per-operation resource bounds for the verified Linux adapter. */
+/** Per-operation resource bounds for the native adapters. */
 export const RECOVERY_LIMITS = {
   inputBytes: 64 * 1024 * 1024,
   outputBytes: 128 * 1024 * 1024,
@@ -36,5 +36,5 @@ export const RECOVERY_LIMITATIONS = [
   "Extraction ranges refer to half-open UTF-8 byte offsets in the original input, not rewritten line positions or whole-bundle coverage.",
   "Emitted source maps are preserved as reported by the engine; their mapping accuracy is not independently established.",
   "Inspection mode may produce non-executable regions. No input or recovered application code is executed.",
-  "Linux adapter: one worker, 1 GiB address-space ceiling, 120-second deadline, 64 MiB total input, 128 MiB output, 10000 output entries and 8 MiB per diagnostic/report stream. Resource limits are per operation, not aggregate host containment.",
+  "One worker, 120-second deadline, 64 MiB total input, 128 MiB observed output, 10000 output entries and 8 MiB per diagnostic/report stream. Output inventory checks do not impose a filesystem quota. Caller-supplied tools remain trusted; no filesystem or network sandbox is provided.",
 ] as const;

@@ -144,7 +144,12 @@ export const runKunaCommand = async (
         ...(installation.script ? { expectedCommand: null } : {}),
         cwd: request.workspace,
         hostEnvironment: kunaChildEnvironment(installation.configuration),
-        env: { TMPDIR: request.workspace },
+        env: {
+          TMPDIR: request.workspace,
+          ...(process.platform === "win32"
+            ? { TEMP: request.workspace, TMP: request.workspace }
+            : {}),
+        },
       },
       {
         timeoutMs: Math.max(1, request.timeoutMs),

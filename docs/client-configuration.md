@@ -434,3 +434,28 @@ npx -y rea-agents@<version> mcp
 
 Do not put credentials in that command or its arguments. `rea doctor --client grok_bot`
 reports this manual step. `rea uninstall` does not remove the account connector.
+
+## Optional analysis handoff to the connected agent
+
+Set `REA_MCP_REVIEW_AFTER_ANALYSIS=1` in the REA MCP server's environment to
+request a report-and-wait workflow. The default (unset or `0`) is off; other
+values are rejected. Reconnect the MCP client after changing the setting.
+The initializing server instructions and successful Evidence responses ask the
+agent to summarize the requested analysis, cite evidence, preserve failures and
+unknowns, then ask the user for their next instruction. This is a client-neutral
+MCP policy, not a Codex integration or a guarantee about an agent's compliance.
+
+Evidence, output schemas and target-content provenance remain unchanged. The
+extra notice is accounted for in the response budget; an overrun retains the
+existing complete-evidence recovery response. Error replies do not advertise a
+successful handoff, and one result does not claim complete application coverage.
+No sampling request, remote upload, client configuration write or autonomous
+follow-up is performed by REA.
+
+Windows Desktop offers the same default-off switch in **环境 → 连接 MCP Agent**
+and a **复制 MCP 连接配置** button. Add that JSON to the client's MCP configuration
+(or map its command, argument array and environment to the client's equivalent
+format), then reconnect. Only explicitly configured provider paths and the
+handoff flag are exported; the ambient environment is not copied. The external
+agent owns its own REA session. This does not send Desktop history to another
+connection or start an agent.

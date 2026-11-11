@@ -246,6 +246,14 @@ export class ArtifactAnalysisResources {
         limits.command_timeout_ms,
         detail,
       );
+    if (cause.snapshot?.memoryLimitReached === true)
+      return new AnalysisResourceConstraintError(
+        operation,
+        "memory",
+        "The owned Windows tool tree reached its Job Object memory limit.",
+        { memory_limit_reached: true },
+        detail,
+      );
     if (cause.reason === "output-limit")
       return new AnalysisResourceConstraintError(
         operation,

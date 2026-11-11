@@ -10,7 +10,10 @@ import ipaddress
 import json
 import math
 import re
-import resource
+import sys
+
+if sys.platform != "win32":
+    import resource
 from pathlib import Path
 from urllib.parse import unquote_to_bytes
 
@@ -351,7 +354,7 @@ def failure_reply(error):
     if isinstance(error, CaptureFailure):
         return {"ok": False, "reason": error.reason, "message": str(error), "pointer": error.pointer}
     if isinstance(error, MemoryError):
-        return {"ok": False, "reason": "resource-limit", "message": "Native decoder exhausted its 768 MiB address-space budget.", "pointer": ""}
+        return {"ok": False, "reason": "resource-limit", "message": "Native decoder exhausted its 768 MiB memory budget.", "pointer": ""}
     return {"ok": False, "reason": "decoder", "message": "Offline native decoder failed unexpectedly: " + type(error).__name__ + ".", "pointer": ""}
 
 
@@ -360,10 +363,13 @@ class OfflineCapture:
         loader.add_option("rea_request_path", str, "", "REA private offline capture request")
 
     def running(self):
-        resource.setrlimit(resource.RLIMIT_AS, (768 * 1024 * 1024, 768 * 1024 * 1024))
-        resource.setrlimit(resource.RLIMIT_CPU, (30, 30))
-        resource.setrlimit(resource.RLIMIT_FSIZE, (OUTPUT_BYTES, OUTPUT_BYTES))
-        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        # On Windows, REA creates the process suspended, assigns a bounded Job
+        # Object, then resumes it. Linux applies its own process limits here.
+        if sys.platform != "win32":
+            resource.setrlimit(resource.RLIMIT_AS, (768 * 1024 * 1024, 768 * 1024 * 1024))
+            resource.setrlimit(resource.RLIMIT_CPU, (30, 30))
+            resource.setrlimit(resource.RLIMIT_FSIZE, (OUTPUT_BYTES, OUTPUT_BYTES))
+            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
         request = json.loads(Path(ctx.options.rea_request_path).read_text(encoding="utf-8"))
         try:
             response = {"ok": True, "value": decode(request)}

@@ -144,6 +144,9 @@ export const publishWakaruArtifacts = async (
     runtime_equivalence: "unknown" as const,
     limitations: [
       ...RECOVERY_LIMITATIONS,
+      context.engine.limiter === null
+        ? "Windows: an owned Job Object enforces 1 GiB committed memory across the tool process tree. Linux address-space, CPU-time and per-file limits do not apply."
+        : "Linux: prlimit enforces 1 GiB address space, 120 CPU seconds, 128 MiB per file and no core dumps. These limits apply per process/file, not across the tool tree.",
       ...(context.admitted.status === "compatible"
         ? [context.admitted.limitation]
         : []),

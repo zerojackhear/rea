@@ -30,6 +30,19 @@ import {
   type OwnedDebuggerDetachResult,
 } from "../process/ownedDebuggerSession.js";
 import { absoluteCallerPath } from "../filesystem/callerPath.js";
+import {
+  OwnedCommandFailure,
+  runOwnedCommand,
+} from "../process/OwnedCommand.js";
+import { resolveWindowsProviderExecutable } from "../process/resolveWindowsProviderExecutable.js";
+import { WindowsOwnedProcess } from "../windows/WindowsOwnedProcess.js";
+import {
+  inspectWindowsDebuggerOutputFile,
+  readWindowsDebuggerState,
+  readWindowsProcessStartTime,
+  verifyWindowsInferiorOutputSink,
+  windowsDebuggerUnavailableReason,
+} from "../windows/WindowsDebuggerObservation.js";
 
 const MAX_SESSIONS = 8;
 const MAX_PENDING_COMMANDS = 16;
@@ -166,6 +179,15 @@ interface RizinProtocolFailure {
   readonly message: string;
 }
 
+type RizinInferiorOutput =
+  | {
+      readonly platform: "linux";
+      readonly path: string;
+      readonly device: number;
+      readonly inode: number;
+    }
+  | { readonly platform: "win32"; readonly path: string };
+
 interface RizinDebugSession {
   readonly id: string;
   readonly launched: SpawnedOwnedProviderProcess;
@@ -181,8 +203,7 @@ interface RizinDebugSession {
   readonly backend: string | null;
   readonly launchProvenance: RizinLaunchProvenance;
   readonly inferiorTty: string;
-  readonly inferiorTtyDevice: number;
-  readonly inferiorTtyInode: number;
+  readonly inferiorOutput: RizinInferiorOutput;
   readonly knownInferiorIdentities: Map<string, OwnedInferiorIdentity>;
   inferiorInventoryComplete: boolean;
   inferiorStateUnknown: () => boolean;
@@ -229,6 +250,10 @@ class RizinFrameTimeoutError extends Error {
 /** Owns persistent Rizin debugger processes independently from BinarySession. */
 export class RizinDebugSessionManager {
   readonly #sessions = new Map<string, RizinDebugSession>();
+  readonly #preflightCleanup = new Map<
+    ProviderProcessSupervisor,
+    AnalysisError
+  >();
   #activeStarts = 0;
   #sessionReservations = 0;
   readonly #environment: Readonly<NodeJS.ProcessEnv>;
@@ -256,12 +281,16 @@ export class RizinDebugSessionManager {
     } = {},
   ) {
     this.#environment = { ...environment };
-    this.#command = environment.REA_RIZIN_COMMAND ?? "rizin";
+    const command = environment.REA_RIZIN_COMMAND ?? "rizin";
     this.#frameTimeoutMs = options.frameTimeoutMs ?? FRAME_TIMEOUT_MS;
     this.#startupTimeoutMs = options.startupTimeoutMs ?? STARTUP_TIMEOUT_MS;
     this.#maxCommandOutputBytes =
       options.maxCommandOutputBytes ?? MAX_COMMAND_OUTPUT_BYTES;
     this.#platform = options.platform ?? process.platform;
+    this.#command =
+      this.#platform === "win32"
+        ? resolveWindowsProviderExecutable(command, this.#environment)
+        : command;
     this.#stopProcess = options.stopProcess ?? stopOwnedDebuggerProcess;
     this.#spawnProcess = options.spawnProcess ?? spawnOwnedProviderProcess;
   }
@@ -281,7 +310,10 @@ export class RizinDebugSessionManager {
   > {
     if (this.#closingAll)
       return err(new AnalysisInputError("start_rizin_debug_session"));
-    const occupied = this.#sessions.size + this.#sessionReservations;
+    const occupied =
+      this.#sessions.size +
+      this.#sessionReservations +
+      this.#preflightCleanup.size;
     if (occupied >= MAX_SESSIONS)
       return err(
         new AnalysisResourceConstraintError(
@@ -325,36 +357,73 @@ export class RizinDebugSessionManager {
   > {
     if (signal?.aborted)
       return err(new AnalysisCancelledError("start_rizin_debug_session"));
-    if (this.#platform !== "linux")
+    const windowsUnavailable =
+      this.#platform === "win32"
+        ? windowsDebuggerUnavailableReason()
+        : undefined;
+    if (
+      (this.#platform !== "linux" && this.#platform !== "win32") ||
+      windowsUnavailable !== undefined
+    )
       return err(
         new AnalysisCapabilityUnavailableError(
           "rizin",
           "start_rizin_debug_session",
-          "Persistent Rizin debugger sessions require Linux /proc descriptor readback to verify inferior detachment and output routing.",
+          windowsUnavailable ??
+            "Persistent Rizin debugger sessions require Linux /proc or the matching Windows native authority.",
         ),
       );
     if (input.inferior_tty === undefined || input.inferior_tty.length === 0)
       return err(new AnalysisInputError("start_rizin_debug_session"));
-    let ttyPath: string;
-    let ttyDevice: number;
-    let ttyInode: number;
-    try {
-      ttyPath = await realpath(input.inferior_tty);
-      const ttyHandle = await open(
-        ttyPath,
-        fsConstants.O_RDWR | fsConstants.O_NOCTTY | fsConstants.O_NONBLOCK,
+    if (
+      this.#platform === "win32" &&
+      input.backend !== undefined &&
+      input.backend !== "native"
+    )
+      return err(
+        new AnalysisCapabilityUnavailableError(
+          "rizin",
+          "start_rizin_debug_session",
+          "Windows output and detach verification requires the native Rizin debug backend.",
+        ),
       );
-      try {
-        const ttyStat = await ttyHandle.stat();
-        if (
-          !isatty(ttyHandle.fd) ||
-          (ttyStat.mode & fsConstants.S_IFMT) !== fsConstants.S_IFCHR
-        )
-          throw new Error("The selected inferior_tty is not a character TTY.");
-        ttyDevice = ttyStat.dev;
-        ttyInode = ttyStat.ino;
-      } finally {
-        await ttyHandle.close();
+    let ttyPath: string;
+    let inferiorOutput: RizinInferiorOutput;
+    try {
+      if (
+        this.#platform === "win32" &&
+        !(await stat(absoluteCallerPath(input.path))).isFile()
+      )
+        throw new Error(
+          "The Windows Rizin target must be an existing regular file.",
+        );
+      ttyPath = await realpath(input.inferior_tty);
+      if (this.#platform === "win32") {
+        inspectWindowsDebuggerOutputFile(ttyPath);
+        inferiorOutput = { platform: "win32", path: ttyPath };
+      } else {
+        const ttyHandle = await open(
+          ttyPath,
+          fsConstants.O_RDWR | fsConstants.O_NOCTTY | fsConstants.O_NONBLOCK,
+        );
+        try {
+          const ttyStat = await ttyHandle.stat();
+          if (
+            !isatty(ttyHandle.fd) ||
+            (ttyStat.mode & fsConstants.S_IFMT) !== fsConstants.S_IFCHR
+          )
+            throw new Error(
+              "The selected inferior_tty is not a character TTY.",
+            );
+          inferiorOutput = {
+            platform: "linux",
+            path: ttyPath,
+            device: ttyStat.dev,
+            inode: ttyStat.ino,
+          };
+        } finally {
+          await ttyHandle.close();
+        }
       }
     } catch (cause) {
       return err(
@@ -365,6 +434,64 @@ export class RizinDebugSessionManager {
     // realpath/open/stat are pending, and must prevent the debugger spawn.
     if (signal?.aborted)
       return err(new AnalysisCancelledError("start_rizin_debug_session"));
+    if (this.#platform === "win32") {
+      try {
+        // No target is supplied to this bounded, ordinary owned process. Older
+        // Rizin builds ignore Windows output profiles and must fail before launch.
+        const probe = await runOwnedCommand(
+          {
+            command: this.#command,
+            arguments: ["-N", "-q", "-c", "e dbg.windows.stdio"],
+            runId: randomUUID(),
+            hostEnvironment: this.#environment,
+          },
+          {
+            timeoutMs: this.#startupTimeoutMs,
+            diagnosticBytes: MAX_DIAGNOSTIC_BYTES,
+          },
+          { signal, launcher: this.#spawnProcess },
+        );
+        if (
+          probe.stdout.text.trim() !== "false" ||
+          probe.stderr.text.trim() !== "" ||
+          probe.stdout.invalidUtf8 ||
+          probe.stderr.invalidUtf8 ||
+          probe.outputIncomplete
+        )
+          throw new Error(
+            "Rizin lacks verified Windows stdio routing. Select a build with the dbg.windows.stdio source fix.",
+          );
+      } catch (cause) {
+        const options: AnalysisErrorOptions = {
+          cause,
+          ...(cause instanceof OwnedCommandFailure &&
+          cause.cleanupFailure !== null
+            ? {
+                cleanup: {
+                  reason: cause.cleanupFailure,
+                  resources: [...cause.resources],
+                },
+              }
+            : {}),
+        };
+        const failure = signal?.aborted
+          ? new AnalysisCancelledError("start_rizin_debug_session", options)
+          : new AnalysisCapabilityUnavailableError(
+              "rizin",
+              "start_rizin_debug_session",
+              cause instanceof Error
+                ? cause.message
+                : "Windows Rizin preflight failed",
+              options,
+            );
+        if (
+          cause instanceof OwnedCommandFailure &&
+          cause.cleanupOwner !== undefined
+        )
+          this.#preflightCleanup.set(cause.cleanupOwner, failure);
+        return err(failure);
+      }
+    }
     const id = randomUUID();
     const resolvedPath = absoluteCallerPath(input.path);
     const launchProvenance: RizinLaunchProvenance = {
@@ -381,6 +508,9 @@ export class RizinDebugSessionManager {
       `stderr=${ttyPath}`,
       "-e",
       "dbg.exitkills=false",
+      ...(this.#platform === "win32"
+        ? ["-e", "dbg.create_new_console=false", "-e", "dbg.windows.stdio=true"]
+        : []),
       ...(input.backend === undefined ? [] : ["-D", input.backend]),
       resolvedPath,
     ];
@@ -392,6 +522,9 @@ export class RizinDebugSessionManager {
         hostEnvironment: this.#environment,
         runId: id,
         stdin: "pipe",
+        ...(this.#platform === "win32"
+          ? { windowsDebuggerLeaderOnly: true as const }
+          : {}),
         ...(signal === undefined ? {} : { signal }),
       });
     } catch (cause) {
@@ -415,12 +548,22 @@ export class RizinDebugSessionManager {
       launchProvenance,
       backend: input.backend ?? null,
       inferiorTty: ttyPath,
-      inferiorTtyDevice: ttyDevice,
-      inferiorTtyInode: ttyInode,
+      inferiorOutput,
       knownInferiorIdentities: new Map(),
       inferiorInventoryComplete: false,
       inferiorStateUnknown: () => !session.inferiorInventoryComplete,
       verifyInferiorsEndedAfterExit: async () => {
+        // Before readiness no user command can attach an unrelated process.
+        // The Windows native backend creates its startup target inside this
+        // non-breakaway job. A fresh empty-job observation proves settlement;
+        // an error string, leader exit or an empty unobserved inventory cannot.
+        if (
+          this.#platform === "win32" &&
+          !session.ready &&
+          launched.process instanceof WindowsOwnedProcess &&
+          launched.process.debuggerLeaderOnly
+        )
+          return launched.process.observeOwnedProcessTreeEnded();
         if (!session.inferiorInventoryComplete) return false;
         const ended = await verifyOwnedInferiorsEnded(
           session.knownInferiorIdentities.values(),
@@ -958,6 +1101,49 @@ export class RizinDebugSessionManager {
     if (session === undefined)
       return err(new AnalysisInputError("close_rizin_debug_session"));
     session.closing = true;
+    const protocolBeforeClose = session.protocolError;
+    if (
+      this.#platform === "win32" &&
+      session.ready &&
+      !session.exited &&
+      protocolBeforeClose === undefined &&
+      session.cleanupFailures.size === 0
+    ) {
+      // Readiness is checked before a detach or termination attempt. A caller
+      // can repair a refused configuration through the same correlated session;
+      // genuine protocol/cleanup failures still retain the existing stop owner.
+      const previous = session.commandTail;
+      let release!: () => void;
+      session.commandTail = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      await previous;
+      try {
+        await this.#inspectInferiorForDetach(session);
+      } catch (cause) {
+        if (session.protocolError !== undefined)
+          return err(
+            this.#retainCleanupFailure(
+              session,
+              "close_rizin_debug_session",
+              session.protocolError.message,
+              { cause },
+            ),
+          );
+        session.closing = false;
+        return err(
+          new AnalysisInputError("close_rizin_debug_session", { cause }, [
+            {
+              path: ["session_id"],
+              reason: "invalid_value",
+              message: `Rizin close was not attempted: ${cause instanceof Error ? cause.message : String(cause)} Repair the selected output/configuration through this session before retrying close.`,
+            },
+          ]),
+        );
+      } finally {
+        release();
+      }
+    }
     const stopped = await this.#stopDebuggerOnly(session);
     if (stopped.status === "incomplete")
       return err(
@@ -972,6 +1158,8 @@ export class RizinDebugSessionManager {
   }
 
   async retryCleanupFailures(): Promise<Result<null, AnalysisError>> {
+    const preflight = await this.#retryPreflightCleanup();
+    if (!preflight.ok) return preflight;
     for (const session of this.#sessions.values()) {
       if (session.cleanupFailures.size === 0) continue;
       const stopped = await this.#stopDebuggerOnly(session);
@@ -989,6 +1177,16 @@ export class RizinDebugSessionManager {
     return ok(null);
   }
 
+  async #retryPreflightCleanup(): Promise<Result<null, AnalysisError>> {
+    for (const [owner, failure] of this.#preflightCleanup) {
+      const stopped = await owner.stop();
+      if (stopped.status === "incomplete") return err(failure);
+      failure.resolveCleanup();
+      this.#preflightCleanup.delete(owner);
+    }
+    return ok(null);
+  }
+
   async closeAll(): Promise<void> {
     this.#closingAll = true;
     if (this.#activeStarts > 0)
@@ -996,11 +1194,21 @@ export class RizinDebugSessionManager {
         this.#startDrainWaiters.push(resolve),
       );
     for (const session of this.#sessions.values()) session.closing = true;
-    return closeOwnedDebuggerSessions(
-      this.#sessions,
-      (session) => this.#stopDebuggerOnly(session),
-      "Rizin",
-    );
+    const failures: unknown[] = [];
+    const preflight = await this.#retryPreflightCleanup();
+    if (!preflight.ok) failures.push(preflight.error);
+    try {
+      await closeOwnedDebuggerSessions(
+        this.#sessions,
+        (session) => this.#stopDebuggerOnly(session),
+        "Rizin",
+      );
+    } catch (cause) {
+      failures.push(cause);
+    }
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1)
+      throw new AggregateError(failures, "Rizin cleanup remains incomplete.");
   }
 
   #receive(session: RizinDebugSession, chunk: Buffer): void {
@@ -1187,65 +1395,131 @@ export class RizinDebugSessionManager {
     }
   }
 
+  async #inspectInferiorForDetach(session: RizinDebugSession): Promise<
+    | {
+        readonly fd: string;
+        readonly pid: string;
+        readonly startTime: string | null;
+      }
+    | undefined
+  > {
+    if (session.exited || session.protocolError !== undefined)
+      throw new Error(
+        "Rizin protocol state is ambiguous; inferior detach is unverified.",
+      );
+    session.inferiorInventoryComplete = false;
+    session.knownInferiorIdentities.clear();
+    const initial = parseRizinInferiorRows(
+      await this.#runInternalCommand(session, "olj"),
+      session.inferiorOutput.platform,
+    );
+    const inferior = initial;
+    if (inferior.length === 0) {
+      session.knownInferiorIdentities.clear();
+      session.inferiorInventoryComplete = true;
+      return undefined;
+    }
+    session.knownInferiorIdentities.clear();
+    for (const [, pid] of inferior) {
+      if (session.knownInferiorIdentities.has(pid)) continue;
+      const startTime =
+        session.inferiorOutput.platform === "win32"
+          ? await readWindowsProcessStartTime(pid)
+          : await readProcStartTime(pid);
+      if (startTime !== null)
+        session.knownInferiorIdentities.set(pid, {
+          pid,
+          startTime,
+        });
+    }
+    session.inferiorInventoryComplete = true;
+    if (inferior.length !== 1)
+      throw new Error(
+        "Rizin reported multiple or ambiguous debugger inferiors.",
+      );
+    const [fd, pid] = inferior[0]!;
+    const processStartTime =
+      session.knownInferiorIdentities.get(pid)?.startTime ?? null;
+    if (processStartTime !== null)
+      await this.#verifyInferiorOutputConfiguration(session, pid);
+    return { fd, pid, startTime: processStartTime };
+  }
+
   async #detachInferiorUnlocked(
     session: RizinDebugSession,
   ): Promise<
     | { readonly status: "no-inferior" }
     | { readonly status: "detached"; readonly outputSink: "durable" }
   > {
-    if (session.exited || session.protocolError !== undefined)
-      throw new Error(
-        "Rizin protocol state is ambiguous; inferior detach is unverified.",
-      );
-    {
-      session.inferiorInventoryComplete = false;
-      session.knownInferiorIdentities.clear();
-      const initial = parseRizinPtraceRows(
-        await this.#runInternalCommand(session, "olj"),
-      );
-      const inferior = initial;
-      if (inferior.length === 0) {
-        session.knownInferiorIdentities.clear();
-        session.inferiorInventoryComplete = true;
-        return { status: "no-inferior" };
-      }
-      session.knownInferiorIdentities.clear();
-      for (const [, pid] of inferior) {
-        if (session.knownInferiorIdentities.has(pid)) continue;
-        const startTime = await readProcStartTime(pid);
-        session.knownInferiorIdentities.set(pid, {
-          pid,
-          startTime,
-        });
-      }
-      session.inferiorInventoryComplete = true;
-      if (inferior.length !== 1)
-        throw new Error(
-          "Rizin reported multiple or ambiguous ptrace inferiors.",
-        );
-      const [fd, pid] = inferior[0]!;
-      const processStartTime = await readProcStartTime(pid);
-      await this.#verifyInferiorOutputConfiguration(session, pid);
+    const selected = await this.#inspectInferiorForDetach(session);
+    if (selected === undefined) return { status: "no-inferior" };
+    const { fd, pid, startTime: processStartTime } = selected;
+    if (
+      processStartTime === null &&
+      session.inferiorOutput.platform === "win32"
+    ) {
+      // A retained descriptor can outlive the target. Only a native observed
+      // exit, followed by an empty inventory, establishes no live inferior.
       await this.#runInternalCommand(session, `o- ${fd}`);
-      const after = parseRizinPtraceRows(
-        await this.#runInternalCommand(session, "olj"),
-      );
       if (
-        after.some(
-          ([activeFd, activePid]) => activeFd === fd || activePid === pid,
-        ) ||
-        after.length !== 0
+        parseRizinInferiorRows(
+          await this.#runInternalCommand(session, "olj"),
+          "win32",
+        ).length !== 0
       )
         throw new Error(
-          "Rizin did not confirm that the selected inferior FD was detached.",
+          "Rizin retained debugger descriptors after the observed target exit.",
         );
-      assertRizinProcessStartTimeStable(
-        processStartTime,
-        await readProcStartTime(pid),
-      );
-      await this.#verifyInferiorOutputConfiguration(session, pid);
-      return { status: "detached", outputSink: "durable" };
+      session.knownInferiorIdentities.clear();
+      return { status: "no-inferior" };
     }
+    if (processStartTime === null)
+      throw new Error("Inferior identity is unknown.");
+    if (session.inferiorOutput.platform === "win32") {
+      const before = readWindowsDebuggerState(pid);
+      if (
+        before === null ||
+        before.startTime !== processStartTime ||
+        !before.attached
+      )
+        throw new Error(
+          "Windows inferior debugger attachment could not be established.",
+        );
+      // Closing w32dbg:// alone does not detach. dp- also ignores provider
+      // failure, so its command response is never treated as detach proof.
+      await this.#runInternalCommand(session, `dp- ${pid}`);
+      const afterDetach = readWindowsDebuggerState(pid);
+      if (
+        afterDetach === null ||
+        afterDetach.startTime !== processStartTime ||
+        afterDetach.attached
+      )
+        throw new Error(
+          "Windows did not confirm that the same inferior was detached.",
+        );
+    }
+    await this.#runInternalCommand(session, `o- ${fd}`);
+    const after = parseRizinInferiorRows(
+      await this.#runInternalCommand(session, "olj"),
+      session.inferiorOutput.platform,
+    );
+    if (
+      after.some(
+        ([activeFd, activePid]) => activeFd === fd || activePid === pid,
+      ) ||
+      after.length !== 0
+    )
+      throw new Error(
+        "Rizin did not confirm that the selected inferior FD was detached.",
+      );
+    assertRizinProcessStartTimeStable(
+      processStartTime,
+      session.inferiorOutput.platform === "win32"
+        ? ((await readWindowsProcessStartTime(pid)) ?? "exited")
+        : await readProcStartTime(pid),
+    );
+    await this.#verifyInferiorOutputConfiguration(session, pid);
+    return { status: "detached", outputSink: "durable" };
   }
 
   async #verifyInferiorOutputConfiguration(
@@ -1257,13 +1531,25 @@ export class RizinDebugSessionManager {
     ).trim();
     if (exitKills !== "false")
       throw new Error("Rizin dbg.exitkills readback did not confirm false.");
+    const output = session.inferiorOutput;
+    if (output.platform === "win32") {
+      await verifyWindowsInferiorOutputSink(pid, output.path, (identity) => {
+        const previous = session.knownInferiorIdentities.get(identity.pid);
+        if (previous !== undefined && previous.startTime !== identity.startTime)
+          throw new Error(
+            "The inferior PID changed during output verification.",
+          );
+        session.knownInferiorIdentities.set(identity.pid, identity);
+      });
+      return;
+    }
     for (const descriptor of ["1", "2"]) {
       const descriptorPath = `/proc/${pid}/fd/${descriptor}`;
       const destination = await readlink(descriptorPath);
       const destinationStat = await stat(descriptorPath);
       if (
-        destinationStat.dev !== session.inferiorTtyDevice ||
-        destinationStat.ino !== session.inferiorTtyInode ||
+        destinationStat.dev !== output.device ||
+        destinationStat.ino !== output.inode ||
         (destinationStat.mode & fsConstants.S_IFMT) !== fsConstants.S_IFCHR ||
         (await realpath(destination)) !== session.inferiorTty
       )
@@ -1277,10 +1563,15 @@ export class RizinDebugSessionManager {
     session: RizinDebugSession,
     command: string,
   ): Promise<string> {
-    if (hasUnclaimedRizinFrames(session))
+    if (hasUnclaimedRizinFrames(session)) {
+      this.#failProtocol(
+        session,
+        "Unsolicited Rizin output prevents correlated cleanup readback.",
+      );
       throw new Error(
         "Unsolicited Rizin output prevents correlated cleanup readback.",
       );
+    }
     const marker = `__REA_CLEANUP_COMPLETE_${randomUUID().replaceAll("-", "")}__`;
     const stdin = session.launched.process.stdin;
     if (
@@ -1288,8 +1579,10 @@ export class RizinDebugSessionManager {
       stdin === undefined ||
       stdin.destroyed ||
       !stdin.writable
-    )
+    ) {
+      this.#failProtocol(session, "Rizin stdin is unavailable during cleanup.");
       throw new Error("Rizin stdin is unavailable during cleanup.");
+    }
     stdin.write(`${command}\n!echo ${marker}\n`);
     const captured = claimRizinCommandCapture(
       session,
@@ -1301,9 +1594,17 @@ export class RizinDebugSessionManager {
         this.#maxCommandOutputBytes,
       ),
     );
-    if (!captured.ok) throw captured.error.cause;
-    if (captured.value.outputTruncated)
+    if (!captured.ok) {
+      this.#failProtocol(
+        session,
+        "Rizin cleanup readback did not reach its correlated completion marker.",
+      );
+      throw captured.error.cause;
+    }
+    if (captured.value.outputTruncated) {
+      this.#failProtocol(session, "Rizin cleanup readback was truncated.");
       throw new Error("Rizin cleanup readback was truncated.");
+    }
     return captured.value.output;
   }
 
@@ -1367,7 +1668,10 @@ export interface RizinDebugCommandResult {
   readonly backend: string | null;
 }
 
-const parseRizinPtraceRows = (output: string): Array<[string, string]> => {
+export const parseRizinInferiorRows = (
+  output: string,
+  platform: "linux" | "win32",
+): Array<[string, string]> => {
   let parsed: unknown;
   try {
     parsed = JSON.parse(output);
@@ -1391,13 +1695,22 @@ const parseRizinPtraceRows = (output: string): Array<[string, string]> => {
         "Rizin `olj` response contains a malformed descriptor row.",
       );
     const uri = (row as { uri: string }).uri;
-    const match = /^ptrace:\/\/(\d+)$/u.exec(uri);
+    const match = (
+      platform === "win32"
+        ? /^(?:w32dbg|attach):\/\/([1-9]\d*)$/u
+        : /^ptrace:\/\/([1-9]\d*)$/u
+    ).exec(uri);
     if (match !== null) {
+      const pid = Number(match[1]);
+      if (!Number.isSafeInteger(pid) || pid > 0xffff_ffff)
+        throw new Error("Rizin `olj` returned an invalid inferior PID.");
       if ((row as { raised: boolean }).raised !== true)
-        throw new Error("Rizin `olj` ptrace descriptor is not active.");
+        throw new Error("Rizin `olj` debugger descriptor is not active.");
       rows.push([String((row as { fd: number }).fd), match[1]!]);
-    } else if (uri.startsWith("ptrace://"))
-      throw new Error("Rizin `olj` returned a malformed ptrace URI.");
+    } else if (uri.includes("://") && !uri.startsWith("file://"))
+      throw new Error(
+        "Rizin `olj` returned an unsupported or malformed descriptor URI; inferior absence is unknown.",
+      );
   }
   return rows;
 };

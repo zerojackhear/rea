@@ -45,6 +45,7 @@ import {
 } from "./GhidraLanguageCatalog.js";
 import {
   ghidraProcessorUnsupportedReason,
+  ghidraPspHostUnsupportedReason,
   isGhidraPspTarget,
 } from "./GhidraPspProfile.js";
 import { resolveGhidraExtensions } from "./extensions/GhidraExtensions.js";
@@ -180,14 +181,13 @@ export class GhidraProvider implements AnalysisProviderCandidate {
         reason: `Ghidra v1 imports executable targets, not ${target.kind} targets.`,
         diagnostics,
       };
-    if (hostPlatform === "win32")
-      return inspectWindowsP0TargetSupport(target, diagnostics);
     const mipsReason =
-      isGhidraPspTarget(target) &&
-      (hostPlatform !== "linux" ||
-        (this.installationHost?.architecture ?? process.arch) !== "x64")
-        ? "The initial PSP Allegrex profile is verified on Linux x64 only."
-        : ghidraProcessorUnsupportedReason(target);
+      (isGhidraPspTarget(target)
+        ? ghidraPspHostUnsupportedReason(
+            hostPlatform,
+            this.installationHost?.architecture ?? process.arch,
+          )
+        : null) ?? ghidraProcessorUnsupportedReason(target);
     if (mipsReason !== null)
       return {
         status: "unsupported",
@@ -195,6 +195,8 @@ export class GhidraProvider implements AnalysisProviderCandidate {
         reason: mipsReason,
         diagnostics,
       };
+    if (hostPlatform === "win32")
+      return inspectWindowsP0TargetSupport(target, diagnostics);
     if (
       isMachOFormat(target.format) &&
       target.availableArchitectures.length > 1
@@ -353,12 +355,16 @@ const inspectWindowsP0TargetSupport = (
   // The raw 6502 lane uses the same immutable snapshot and native ownership boundary.
   if (target.format === "raw-binary" && target.architecture === "6502")
     return { status: "supported", code: null, reason: null, diagnostics };
+  // PSP declarations were validated before host-specific target admission.
+  // This read-only lane uses the same immutable input and native ownership.
+  if (isGhidraPspTarget(target))
+    return { status: "supported", code: null, reason: null, diagnostics };
   if (target.format !== "pe")
     return {
       status: "unsupported",
       code: "target_format_unsupported",
       reason:
-        "Windows Ghidra P0 accepts native PE and explicitly selected raw 6502 targets only.",
+        "Windows Ghidra P0 accepts native PE, verified static PSP ELF and explicitly selected raw 6502 targets only.",
       diagnostics,
     };
   if (!WINDOWS_P0_NATIVE_PE_ARCHITECTURES.includes(target.architecture))

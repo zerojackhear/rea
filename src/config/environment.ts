@@ -1,3 +1,4 @@
+import { mcpAgentReviewSchema } from "./mcpAgentReview.js";
 import { z } from "zod";
 import { isAbsolute } from "node:path";
 
@@ -22,6 +23,7 @@ import { parseLoaderArgs, parseStringArray } from "./parsers.js";
 
 const environmentSchema = z.object({
   REA_ANALYSIS_PROVIDER: analysisProviderSelectorSchema.default("auto"),
+  REA_MCP_REVIEW_AFTER_ANALYSIS: mcpAgentReviewSchema.optional(),
   REA_MCP_MAX_RESPONSE_BYTES: mcpResponseBudgetSchema.optional(),
   REA_MCP_INPUT_SCHEMA_PROFILE: mcpInputSchemaProfileSchema.optional(),
   REA_MCP_OUTPUT_SCHEMA_PROFILE: mcpOutputSchemaProfileSchema.optional(),

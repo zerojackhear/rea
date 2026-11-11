@@ -25,7 +25,7 @@ export const UNBLOB_PROVIDER_IDENTITY = {
   version: FIRMWARE_RELEASES.unblob.version,
 } as const;
 
-/** Resource policy for this Linux integration, not a claim of aggregate containment. */
+/** Input/report budgets and native host limits; Windows enforces job commit, Linux address space. */
 export const FIRMWARE_LIMITS = {
   inputBytes: 128 * 1024 * 1024,
   reportBytes: 8 * 1024 * 1024,

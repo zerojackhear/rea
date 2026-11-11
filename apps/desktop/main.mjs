@@ -14,11 +14,23 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
+import { createRequire } from "node:module";
 import { EngineBridge, canAcknowledgeUnknownClose } from "./bridge.mjs";
 import { DESKTOP_NODE_VERSION } from "./runtime-pins.mjs";
+import { describeTarget } from "./target.mjs";
+import {
+  loadMcpSettings,
+  saveMcpSettings,
+  desktopMcpConfiguration,
+} from "./mcp-settings.mjs";
+import { providerEnvironment } from "./provider-environment.mjs";
 
 const appRoot = dirname(fileURLToPath(import.meta.url));
 const rendererRoot = join(appRoot, "renderer");
+// Electron's patched fs presents ASAR archives as virtual directories.
+const targetStat = promisify(
+  createRequire(import.meta.url)("original-fs").stat,
+);
 const coreRoot = app.isPackaged
   ? join(process.resourcesPath, "core")
   : resolve(appRoot, "../..");
@@ -47,8 +59,14 @@ protocol.registerSchemesAsPrivileged([
 ]);
 app.setName("REA Desktop");
 app.setAppUserModelId("tools.rea.desktop");
-if (process.env.REA_DESKTOP_USER_DATA_DIR)
-  app.setPath("userData", resolve(process.env.REA_DESKTOP_USER_DATA_DIR));
+const baseDataDirectory = resolve(
+  process.env.REA_DESKTOP_USER_DATA_DIR ?? app.getPath("userData"),
+);
+app.setPath("userData", baseDataDirectory);
+const windowState = (value) => ({
+  ...value,
+  desktopHost: "windows",
+});
 if (!app.requestSingleInstanceLock()) app.quit();
 else {
   app.on("second-instance", () => {
@@ -170,7 +188,7 @@ else {
         minHeight: 760,
         show: false,
         frame: false,
-        title: "REA Desktop",
+        title: "REA Desktop · Windows 分析",
         backgroundColor: "#f5f6f8",
         webPreferences: {
           preload: join(appRoot, "preload.cjs"),
@@ -205,10 +223,31 @@ else {
         if (!request || !allowedMethods.has(request.method))
           throw new Error("不支持的操作");
         if (!engine) {
-          if (request.method === "state") return startupState;
+          if (request.method === "state") return windowState(startupState);
           throw new Error(startupState.error ?? "本地分析引擎正在连接");
         }
-        return engine.request(request.method, request.payload);
+        const value = await engine.request(request.method, request.payload);
+        return request.method === "state" ? windowState(value) : value;
+      });
+      ipcMain.handle("rea:mcp-settings", (event) => {
+        assertSender(event);
+        return loadMcpSettings(baseDataDirectory);
+      });
+      ipcMain.handle("rea:save-mcp-settings", (event, enabled) => {
+        assertSender(event);
+        return saveMcpSettings(baseDataDirectory, enabled);
+      });
+      ipcMain.handle("rea:mcp-configuration", async (event) => {
+        assertSender(event);
+        return JSON.stringify(
+          await desktopMcpConfiguration({
+            directory: baseDataDirectory,
+            coreRoot,
+            nodePath,
+          }),
+          null,
+          2,
+        );
       });
       ipcMain.handle("rea:example", (event) => {
         assertSender(event);
@@ -219,11 +258,18 @@ else {
           arguments: { input_path: path, detail: "complete" },
         };
       });
+      ipcMain.handle("rea:describe-target", (event, path) => {
+        assertSender(event);
+        return describeTarget(path, targetStat);
+      });
       ipcMain.handle("rea:pick-path", async (event, options) => {
         assertSender(event);
         if (!options || !["file", "directory"].includes(options.kind))
           throw new Error("请选择文件或文件夹");
         const selected = await dialog.showOpenDialog(mainWindow, {
+          ...(typeof options.defaultPath === "string"
+            ? { defaultPath: options.defaultPath }
+            : {}),
           title:
             typeof options.title === "string"
               ? options.title.slice(0, 160)
@@ -292,10 +338,16 @@ else {
           engine: join(appRoot, "engine.mjs"),
           coreRoot,
           dataDir: app.getPath("userData"),
+          environment: await providerEnvironment(app.getPath("userData")),
         });
         engine.on("event", (message) => {
           if (!mainWindow.isDestroyed())
-            mainWindow.webContents.send("rea:event", message);
+            mainWindow.webContents.send(
+              "rea:event",
+              message.event === "state"
+                ? { ...message, value: windowState(message.value) }
+                : message,
+            );
         });
       } catch (error) {
         startupState = {

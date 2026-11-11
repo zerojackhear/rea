@@ -18,6 +18,7 @@ import {
 } from "../../domain/webNetworkCapture.js";
 import { OwnedCommandFailure } from "../../process/OwnedCommand.js";
 import {
+  MITMPROXY_CAPTURE_MEMORY_BYTES,
   NODE_CAPTURE_HEAP_ENFORCED,
   NODE_CAPTURE_HEAP_LIMITS,
   NODE_CAPTURE_PROCESS_MEMORY_LIMIT_BYTES,
@@ -206,6 +207,11 @@ export const captureMemoryFailure = (
         ? {
             process_memory_limit_bytes: NODE_CAPTURE_PROCESS_MEMORY_LIMIT_BYTES,
           }
+        : {}),
+      ...(input.format === "mitmproxy"
+        ? process.platform === "win32"
+          ? { process_memory_limit_bytes: MITMPROXY_CAPTURE_MEMORY_BYTES }
+          : { address_space_limit_bytes: MITMPROXY_CAPTURE_MEMORY_BYTES }
         : {}),
       ...(cause instanceof OwnedCommandFailure
         ? {

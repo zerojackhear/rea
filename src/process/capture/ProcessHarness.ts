@@ -1,4 +1,6 @@
-import type { IPty } from "@lydell/node-pty";
+import type { ProcessCaptureTerminal } from "./ProcessCaptureTerminal.js";
+import { WindowsPtyProcess } from "../../windows/WindowsPtyProcess.js";
+import { windowsProcessScenarioUnavailableReason } from "./ProcessCaptureCapability.js";
 import type { ProcessCapture } from "../../domain/process/processCaptureParsing.js";
 import type { ProcessScenario } from "../../domain/process/processScenario.js";
 import { parseProcessCapture } from "../../domain/process/processCaptureParsing.js";
@@ -77,7 +79,7 @@ import { monotonicProcessCaptureClock } from "./ProcessCaptureClock.js";
 
 interface StartedCaptureRuntime {
   readonly renderer: TerminalRenderer;
-  readonly terminal: IPty;
+  readonly terminal: ProcessCaptureTerminal;
   readonly started: number;
   readonly startedAt: Date;
   readonly executableIdentity: ReturnType<typeof observeLaunchedExecutable>;
@@ -160,7 +162,7 @@ export const retainRootSignaller = (
 const cleanupFailedStartup = async (options: {
   readonly cause: unknown;
   readonly timers: Set<ProcessTimer>;
-  readonly terminal: IPty | undefined;
+  readonly terminal: ProcessCaptureTerminal | undefined;
   readonly renderer: TerminalRenderer | undefined;
   readonly runId: string;
   readonly captureBaseline: ProcessOwnershipBaseline;
@@ -241,6 +243,7 @@ const createTerminalRenderer = (
   });
 
 interface StartCaptureRuntimeOptions {
+  readonly hostPlatform: NodeJS.Platform;
   readonly scenario: ProcessScenario;
   readonly hostEnvironment: Readonly<Record<string, string | undefined>>;
   readonly temporaryRoot: string;
@@ -265,9 +268,8 @@ const startCaptureRuntime = async (
 ): Promise<StartedCaptureRuntime> => {
   const { scenario } = options;
   let renderer: TerminalRenderer | undefined;
-  let terminal: IPty | undefined;
+  let terminal: ProcessCaptureTerminal | undefined;
   try {
-    const { spawn } = await import("@lydell/node-pty");
     const selectedExecutable = await observeSelectedExecutable(
       scenario.executable,
       options.signal,
@@ -285,13 +287,25 @@ const startCaptureRuntime = async (
       normalizeText,
       options.recordEvent,
     );
-    terminal = spawn(scenario.executable, [...scenario.arguments], {
+    const terminalOptions = {
       cwd: scenario.working_directory,
       env: makeProcessCaptureEnvironment(options),
       cols: scenario.terminal.columns,
       rows: scenario.terminal.rows,
       name: "xterm-256color",
-    });
+    };
+    terminal =
+      options.hostPlatform === "win32"
+        ? new WindowsPtyProcess(
+            scenario.executable,
+            scenario.arguments,
+            terminalOptions,
+          )
+        : (await import("@lydell/node-pty")).spawn(
+            scenario.executable,
+            [...scenario.arguments],
+            terminalOptions,
+          );
     options.onSpawn(terminal.pid);
     options.observationBuffer.target_pid = {
       state: "available",
@@ -315,7 +329,15 @@ const startCaptureRuntime = async (
       renderer,
       started,
     });
+    const windowsTerminal =
+      terminal instanceof WindowsPtyProcess ? terminal : undefined;
     const stopSampler = startProcessSampler({
+      ...(windowsTerminal === undefined
+        ? {}
+        : {
+            sampleOwnedProcesses: (elapsedMs: number, limit: number) =>
+              windowsTerminal.sample(elapsedMs, limit),
+          }),
       rootPid: terminal.pid,
       runId: options.runId,
       started,
@@ -332,12 +354,15 @@ const startCaptureRuntime = async (
       lastOutput: () => lastOutput,
       terminalRetention,
       stopSampler,
-      signalRoot: retainRootSignaller(
-        terminal.pid,
-        scenario.finalization_ms,
-        options.runId,
-        options.finalizationHost,
-      ),
+      signalRoot:
+        windowsTerminal === undefined
+          ? retainRootSignaller(
+              terminal.pid,
+              scenario.finalization_ms,
+              options.runId,
+              options.finalizationHost,
+            )
+          : (signal) => windowsTerminal.signalRoot(signal),
     };
   } catch (cause: unknown) {
     return cleanupFailedStartup({
@@ -490,6 +515,7 @@ const completeCapture = async (options: {
       options.hostPlatform,
       options.signal,
       options.onLiveProgress,
+      runtime.terminal,
     );
   } catch (cause: unknown) {
     options.observationBuffer.settlement = {
@@ -569,6 +595,9 @@ const completeCapture = async (options: {
       new Date(),
       runtime.executableIdentity,
       { platform: options.hostPlatform, architecture: process.arch },
+      runtime.terminal instanceof WindowsPtyProcess
+        ? "windows-conpty"
+        : "node-pty",
     );
   } catch (cause: unknown) {
     options.observationBuffer.manifest = {
@@ -701,6 +730,7 @@ const runProcessScenario = async (
 
   try {
     runtime = await startCaptureRuntime({
+      hostPlatform,
       scenario,
       hostEnvironment,
       temporaryRoot,
@@ -845,7 +875,11 @@ export const captureProcessScenario = async (
   resourceScope?: ProcessCaptureResourceScope,
   finalizationHost?: FinalizationHost,
 ): Promise<Result<ProcessCapture, ProcessCaptureError | AnalysisError>> => {
-  const ownershipReason = processCaptureOwnershipUnavailableReason(platform);
+  const ownershipReason =
+    processCaptureOwnershipUnavailableReason(platform) ??
+    (platform === "win32"
+      ? windowsProcessScenarioUnavailableReason(scenario)
+      : undefined);
   if (ownershipReason !== undefined)
     return err(
       new AnalysisCapabilityUnavailableError(

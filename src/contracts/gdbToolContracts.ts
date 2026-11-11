@@ -28,12 +28,12 @@ export const GDB_TOOL_CONTRACTS = [
     ...toolContractMetadata("start_gdb_session"),
     kind: "native-provider",
     description:
-      "Start a BYO GDB process in MI3 mode when available, suppress startup files, and disable auto-loading. Persistent GDB sessions are available only on Linux, where REA can verify live inferior output descriptors through /proc before detaching; macOS descriptor verification is not implemented, and Windows Job Object cleanup can terminate debugger inferiors. Optionally set inferior_tty to a caller-selected terminal for future inferior runs; REA verifies the setting through GDB/MI before the session becomes ready. The selected terminal must remain available after GDB exits. A live inferior can be detached during close only while this durable output sink remains verified. The session persists in this REA MCP server process and receives an explicit session ID.",
+      "Start a BYO GDB process in MI3 mode when available, suppress startup files, and disable auto-loading. Available on Linux and Windows x64 with matching native controls and a Python-enabled Windows GDB. Optionally set inferior_tty to a caller-selected durable Linux terminal or an existing regular local NTFS file on Windows; GDB may truncate that file when starting an inferior. REA verifies the exact GDB setting and live inferior output identity before automatic detach. Windows startup prevents inheritance of private GDB protocol pipes; cleanup controls only the debugger, leaving a verified detached target running. The session persists in this REA MCP server process and receives an explicit session ID.",
     inputSchema: z.strictObject({
       inferior_tty: localPathStringSchema
         .optional()
         .describe(
-          "Caller-selected terminal path for future inferior runs. GDB must report the exact configured path before the session is ready.",
+          "Caller-selected durable Linux terminal, or existing regular local NTFS output file on Windows (may be truncated by GDB). GDB must report this exact path before the session is ready.",
         ),
     }),
     outputSchema: z.strictObject({
@@ -97,7 +97,7 @@ export const GDB_TOOL_CONTRACTS = [
     ...toolContractMetadata("close_gdb_session"),
     kind: "native-provider",
     description:
-      "Close the owned GDB process after verifying the inferior state. When one live thread group has a verified durable output TTY, REA automatically detaches it, which may resume target execution; otherwise close reports that a disposition is required. REA never kills attached or remote targets as part of debugger cleanup. In a shared MCP server, this admitted close retires any active binary-analysis session; after target effects have settled, call open_binary before further analysis. Close an active Ghidra session explicitly first.",
+      "Close the owned GDB process after verifying the inferior state. When one live thread group has a verified durable output terminal or Windows file, REA automatically detaches it, which may resume target execution; otherwise close reports that a disposition is required. Windows output verification currently supports native x64 inferiors. REA never kills attached or remote targets as part of debugger cleanup. In a shared MCP server, this admitted close retires any active binary-analysis session; after target effects have settled, call open_binary before further analysis. Close an active Ghidra session explicitly first.",
     inputSchema: z.strictObject({ session_id: sessionId }),
     outputSchema: z.strictObject({
       target_state: z.enum(["none_observed", "unknown"]),

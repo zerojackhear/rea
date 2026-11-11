@@ -2,7 +2,7 @@ REA npm dependency inventory
 Prepared from the root package-lock.json; refresh this inventory when locked dependencies change.
 License identifiers are upstream lockfile declarations, not a legal assessment.
 Runtime includes transitive and optional platform packages; development includes build, test and website tooling.
-Locked package entries: 722; runtime: 178.
+Locked package entries: 726; runtime: 181.
 Full runtime copyright/license/NOTICE texts: npm-runtime-notices.txt.
 
 @algolia/abtesting@1.25.0 | development | MIT
@@ -375,6 +375,11 @@ commander@13.1.0 | runtime | MIT
   Package: https://www.npmjs.com/package/commander/v/13.1.0
   Archive: https://registry.npmjs.org/commander/-/commander-13.1.0.tgz
   Integrity: sha512-/rFeCpNJQbhSZjGVwO9RFV3xPqbnERS8MmIQzCtD/zl6gpJuV/bMLuN92oG3F7d8oDEHHRrujSXNUr8fpjntKw==
+minimatch@11.0.1 | runtime | BlueOak-1.0.0
+  Lockfile path: node_modules/@electron/asar/node_modules/minimatch
+  Package: https://www.npmjs.com/package/minimatch/v/11.0.1
+  Archive: https://registry.npmjs.org/minimatch/-/minimatch-11.0.1.tgz
+  Integrity: sha512-t+Vn6DX4wPCxS23y03C0uhF7S1jpi1GfqPrnlEipCJaA2ykiNbMkVlDutZtmvLfRcUN6R8AYVlzTsQrT4RZoLQ==
 @emnapi/core@1.11.2 | development, optional | MIT
   Lockfile path: node_modules/@emnapi/core
   Package: https://www.npmjs.com/package/@emnapi/core/v/1.11.2
@@ -485,6 +490,11 @@ commander@13.1.0 | runtime | MIT
   Package: https://www.npmjs.com/package/@inquirer/type/v/4.2.0
   Archive: https://registry.npmjs.org/@inquirer/type/-/type-4.2.0.tgz
   Integrity: sha512-2rnHX8RPo4glJYqnFc/v3nQeIhDcjyRRyaT7MGcfL/8xv/8K03SXYoA2tX06WVSKywWOE/ncbG3dtuzLjR5TCQ==
+@isaacs/nonrecursive-glob-match@1.1.0 | runtime | BlueOak-1.0.0
+  Lockfile path: node_modules/@isaacs/nonrecursive-glob-match
+  Package: https://www.npmjs.com/package/@isaacs/nonrecursive-glob-match/v/1.1.0
+  Archive: https://registry.npmjs.org/@isaacs/nonrecursive-glob-match/-/nonrecursive-glob-match-1.1.0.tgz
+  Integrity: sha512-GPm/Dbvk5RLmhRnxXIa7nTpK0xtl4E0wj0MslsuNiJ1FIROU+2+9lgUC/dgF7Ey4QCWhfEsgxilMRMCdHPfDfw==
 @jridgewell/gen-mapping@0.4.0-beta.0 | development | MIT
   Lockfile path: node_modules/@jridgewell/gen-mapping
   Package: https://www.npmjs.com/package/@jridgewell/gen-mapping/v/0.4.0-beta.0
@@ -2140,6 +2150,11 @@ frida@17.23.2 | runtime, optional | LGPL-2.0 WITH WxWindows-exception-3.1
   Package: https://www.npmjs.com/package/frida/v/17.23.2
   Archive: https://registry.npmjs.org/frida/-/frida-17.23.2.tgz
   Integrity: sha512-gRCmmTUFdEILyHRN1b66erRoXafwsfWTqXyoBBqkSCFX0Ue7Jhvs/KhA3JO0XrgITNlPd91QAGsFvWzh0mhVgg==
+minimatch@11.0.1 | runtime, optional | BlueOak-1.0.0
+  Lockfile path: node_modules/frida/node_modules/minimatch
+  Package: https://www.npmjs.com/package/minimatch/v/11.0.1
+  Archive: https://registry.npmjs.org/minimatch/-/minimatch-11.0.1.tgz
+  Integrity: sha512-t+Vn6DX4wPCxS23y03C0uhF7S1jpi1GfqPrnlEipCJaA2ykiNbMkVlDutZtmvLfRcUN6R8AYVlzTsQrT4RZoLQ==
 fs-constants@1.0.0 | runtime, optional | MIT
   Lockfile path: node_modules/fs-constants
   Package: https://www.npmjs.com/package/fs-constants/v/1.0.0
@@ -2190,11 +2205,16 @@ github-from-package@0.0.0 | runtime, optional | MIT
   Package: https://www.npmjs.com/package/github-from-package/v/0.0.0
   Archive: https://registry.npmjs.org/github-from-package/-/github-from-package-0.0.0.tgz
   Integrity: sha512-SyHy3T1v2NUXn29OsWdxmK6RwHD+vkj3v8en8AOBZ1wBQ/hCAQ5bAQTD02kW4W9tUp/3Qh6J8r9EvntiyCmOOw==
-glob@13.0.6 | runtime | BlueOak-1.0.0
+glob@14.0.2 | runtime | BlueOak-1.0.0
   Lockfile path: node_modules/glob
-  Package: https://www.npmjs.com/package/glob/v/13.0.6
-  Archive: https://registry.npmjs.org/glob/-/glob-13.0.6.tgz
-  Integrity: sha512-Wjlyrolmm8uDpm/ogGyXZXb1Z+Ca2B8NbJwqBVg0axK9GbBeoS7yGV6vjXnYdGm6X53iehEuxxbyiKp8QmN4Vw==
+  Package: https://www.npmjs.com/package/glob/v/14.0.2
+  Archive: https://registry.npmjs.org/glob/-/glob-14.0.2.tgz
+  Integrity: sha512-vfMgTR2djMHPUchsJMLpZlYQvtjVL+mHpEr5wPpoCbQs2vr/FBNK+3Gnl9Ara1DSs4Aeg4eG9HiADb5/rkY/ZA==
+minimatch@11.0.1 | runtime | BlueOak-1.0.0
+  Lockfile path: node_modules/glob/node_modules/minimatch
+  Package: https://www.npmjs.com/package/minimatch/v/11.0.1
+  Archive: https://registry.npmjs.org/minimatch/-/minimatch-11.0.1.tgz
+  Integrity: sha512-t+Vn6DX4wPCxS23y03C0uhF7S1jpi1GfqPrnlEipCJaA2ykiNbMkVlDutZtmvLfRcUN6R8AYVlzTsQrT4RZoLQ==
 gopd@1.2.0 | runtime | MIT
   Lockfile path: node_modules/gopd
   Package: https://www.npmjs.com/package/gopd/v/1.2.0
@@ -2530,11 +2550,11 @@ lossless-json@4.3.1 | runtime | MIT
   Package: https://www.npmjs.com/package/lossless-json/v/4.3.1
   Archive: https://registry.npmjs.org/lossless-json/-/lossless-json-4.3.1.tgz
   Integrity: sha512-SqD/Bg3ZfltBJ2Z14hJ/BihnvtV553WO4g9/ePtlp4lrnl9jF3AdIJt53A/Wkg/0Li+LMfxaBqgx1MiFZdQlpQ==
-lru-cache@11.5.2 | runtime | BlueOak-1.0.0
+lru-cache@11.5.3 | runtime | BlueOak-1.0.0
   Lockfile path: node_modules/lru-cache
-  Package: https://www.npmjs.com/package/lru-cache/v/11.5.2
-  Archive: https://registry.npmjs.org/lru-cache/-/lru-cache-11.5.2.tgz
-  Integrity: sha512-4pfM1Ff0x50o0tQwb5ucw/RzNyD0/YJME6IVcStalZuMWxdt3sR3huStTtxz4PUmvZfRguvDejasvQ2kifR11g==
+  Package: https://www.npmjs.com/package/lru-cache/v/11.5.3
+  Archive: https://registry.npmjs.org/lru-cache/-/lru-cache-11.5.3.tgz
+  Integrity: sha512-U4N8FgzmWxc8k1VH8Kr6lQg18U7Fjvby6wXHVRX/ZZ7IwWbRMgrRbP0Wrb5q5NVinryp4SQampHKdvtecItxUg==
 magic-string@1.4.3 | development | MIT
   Lockfile path: node_modules/magic-string
   Package: https://www.npmjs.com/package/magic-string/v/1.4.3
@@ -2620,7 +2640,7 @@ minimalistic-assert@1.0.1 | development | ISC
   Package: https://www.npmjs.com/package/minimalistic-assert/v/1.0.1
   Archive: https://registry.npmjs.org/minimalistic-assert/-/minimalistic-assert-1.0.1.tgz
   Integrity: sha512-UtJcAD4yEaGtjPezWuO9wC4nwUnVH/8/Im3yEHQP4b67cXlD/Qr9hdITCU1xDbSEXg2XKNaP8jsReV7vQd00/A==
-minimatch@10.2.5 | runtime | BlueOak-1.0.0
+minimatch@10.2.5 | development | BlueOak-1.0.0
   Lockfile path: node_modules/minimatch
   Package: https://www.npmjs.com/package/minimatch/v/10.2.5
   Archive: https://registry.npmjs.org/minimatch/-/minimatch-10.2.5.tgz
@@ -2800,11 +2820,11 @@ path-key@3.1.1 | runtime | MIT
   Package: https://www.npmjs.com/package/path-key/v/3.1.1
   Archive: https://registry.npmjs.org/path-key/-/path-key-3.1.1.tgz
   Integrity: sha512-ojmeN0qd+y0jszEtoY48r0Peq5dwMEkIlCOu6Q5f41lfkswXuKtYrhgoTpLnyIcHm24Uhqx+5Tqm2InSwLhE6Q==
-path-scurry@2.0.2 | runtime | BlueOak-1.0.0
+path-scurry@3.0.0 | runtime | BlueOak-1.0.0
   Lockfile path: node_modules/path-scurry
-  Package: https://www.npmjs.com/package/path-scurry/v/2.0.2
-  Archive: https://registry.npmjs.org/path-scurry/-/path-scurry-2.0.2.tgz
-  Integrity: sha512-3O/iVVsJAPsOnpwWIeD+d6z/7PmqApyQePUtCndjatj/9I5LylHvt5qluFaBT3I5h3r1ejfR056c+FCv+NnNXg==
+  Package: https://www.npmjs.com/package/path-scurry/v/3.0.0
+  Archive: https://registry.npmjs.org/path-scurry/-/path-scurry-3.0.0.tgz
+  Integrity: sha512-1pTbQqH1wIwMi/eleQ5leFTTCkzFsPcgXNjwOA8YGGW/W4/kHT3dssE7Z6NH+zuqNLOzOB0uaD61yl7cAcVhgg==
 perfect-debounce@1.0.0 | development | MIT
   Lockfile path: node_modules/perfect-debounce
   Package: https://www.npmjs.com/package/perfect-debounce/v/1.0.0

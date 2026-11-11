@@ -1,0 +1,179 @@
+--- a/CPP/Build.mak
++++ b/CPP/Build.mak
+@@ -22,7 +22,7 @@
+ # CFLAGS = $(CFLAGS) -FAsc -Fa$O/asm/
+ !ENDIF
+ 
+-# LFLAGS = $(LFLAGS) /guard:cf
++LFLAGS = $(LFLAGS) /guard:cf /DYNAMICBASE /NXCOMPAT
+ 
+ 
+ !IF "$(PLATFORM)" == "x64"
+@@ -98,7 +98,7 @@
+ 
+ !IFNDEF OLD_COMPILER
+ 
+-CFLAGS = $(CFLAGS) -GS- -Zc:wchar_t
++CFLAGS = $(CFLAGS) -GS -guard:cf -Zc:wchar_t
+ !IFDEF VCTOOLSVERSION
+ !IF "$(VCTOOLSVERSION)" >= "14.00"
+ !IF "$(CC)" != "clang-cl"
+--- a/CPP/7zip/Archive/ExtHandler.cpp
++++ b/CPP/7zip/Archive/ExtHandler.cpp
+@@ -1620,15 +1620,6 @@
+ }
+ 
+ 
+-static void ChangeSeparatorsInName(char *s, unsigned num)
+-{
+-  for (unsigned i = 0; i < num; i++)
+-  {
+-    char c = s[i];
+-    if (c == CHAR_PATH_SEPARATOR || c == '/')
+-      s[i] = '_';
+-  }
+-}
+ 
+ 
+ void CHandler::GetPath(unsigned index, AString &s) const
+@@ -1645,10 +1636,10 @@
+   {
+     const CItem &item = _items[index];
+     if (!s.IsEmpty())
+-      s.InsertAtFront(CHAR_PATH_SEPARATOR);
++      s.InsertAtFront('/');
+     s.Insert(0, item.Name);
+     // 18.06
+-    ChangeSeparatorsInName(s.GetBuf(), item.Name.Len());
++    if (item.Name.Find('/') >= 0) throw E_INVALIDARG;
+ 
+     if (item.ParentNode == k_INODE_ROOT)
+       return;
+@@ -1658,7 +1649,7 @@
+       int aux = GetParentAux(item);
+       if (aux < 0)
+         break;
+-      s.InsertAtFront(CHAR_PATH_SEPARATOR);
++      s.InsertAtFront('/');
+       s.Insert(0, _auxItems[aux]);
+       return;
+     }
+@@ -1670,8 +1661,7 @@
+ 
+     if (s.Len() > ((UInt32)1 << 16))
+     {
+-      s.Insert(0, "[LONG]" STRING_PATH_SEPARATOR);
+-      return;
++      throw E_INVALIDARG;
+     }
+   }
+ }
+@@ -2063,8 +2053,8 @@
+       {
+         AString s;
+         GetPath(index, s);
+-        if (!_isUTF || !ConvertUTF8ToUnicode(s, u))
+-          MultiByteToUnicodeString2(u, s);
++        if (!ConvertUTF8ToUnicode(s, u))
++          return E_INVALIDARG;
+       }
+       prop = u;
+       break;
+--- a/CPP/7zip/Archive/SquashfsHandler.cpp
++++ b/CPP/7zip/Archive/SquashfsHandler.cpp
+@@ -1766,7 +1766,8 @@
+     const unsigned size = (_h.IsOldVersion() ? (unsigned)p[2] : (unsigned)Get16(p + 6)) + 1;
+     p += _h.GetFileNameOffset();
+     unsigned i;
+-    for (i = 0; i < size && p[i]; i++);
++    for (i = 0; i < size; i++)
++      if (!p[i] || p[i] == '/') throw E_INVALIDARG;
+     len += i + 1;
+     index = (unsigned)item.Parent;
+     if (item.Parent < 0)
+@@ -1784,13 +1785,14 @@
+     const unsigned size = (_h.IsOldVersion() ? (unsigned)p[2] : (unsigned)Get16(p + 6)) + 1;
+     p += _h.GetFileNameOffset();
+     unsigned i;
+-    for (i = 0; i < size && p[i]; i++);
++    for (i = 0; i < size; i++)
++      if (!p[i] || p[i] == '/') throw E_INVALIDARG;
+     dest -= i;
+     memcpy(dest, p, i);
+     index = (unsigned)item.Parent;
+     if (item.Parent < 0)
+       break;
+-    *(--dest) = CHAR_PATH_SEPARATOR;
++    *(--dest) = '/';
+   }
+   return path;
+ }
+@@ -2032,10 +2034,8 @@
+     {
+       AString path (GetPath(index));
+       UString s;
+-      if (_openCodePage == CP_UTF8)
+-        ConvertUTF8ToUnicode(path, s);
+-      else
+-        MultiByteToUnicodeString2(s, path, _openCodePage);
++      if (!ConvertUTF8ToUnicode(path, s))
++        return E_INVALIDARG;
+       prop = s;
+       break;
+     }
+--- a/CPP/7zip/Archive/CramfsHandler.cpp
++++ b/CPP/7zip/Archive/CramfsHandler.cpp
+@@ -1,6 +1,7 @@
+ // CramfsHandler.cpp
+ 
+ #include "StdAfx.h"
++#include "../../Common/UTFConvert.h"
+ 
+ #include "../../../C/7zCrc.h"
+ #include "../../../C/Alloc.h"
+@@ -396,7 +397,10 @@
+     unsigned size = GetNameLen(p, _h.be);
+     p += kNodeSize;
+     unsigned i;
+-    for (i = 0; i < size && p[i]; i++);
++    for (i = 0; i < size && p[i]; i++)
++      if (p[i] == '/') throw E_INVALIDARG;
++    for (unsigned padding = i; padding < size; ++padding)
++      if (p[padding]) throw E_INVALIDARG;
+     len += i + 1;
+     index = (unsigned)item.Parent;
+     if (item.Parent < 0)
+@@ -414,13 +418,16 @@
+     unsigned size = GetNameLen(p, _h.be);
+     p += kNodeSize;
+     unsigned i;
+-    for (i = 0; i < size && p[i]; i++);
++    for (i = 0; i < size && p[i]; i++)
++      if (p[i] == '/') throw E_INVALIDARG;
++    for (unsigned padding = i; padding < size; ++padding)
++      if (p[padding]) throw E_INVALIDARG;
+     dest -= i;
+     memcpy(dest, p, i);
+     index = (unsigned)item.Parent;
+     if (item.Parent < 0)
+       break;
+-    *(--dest) = CHAR_PATH_SEPARATOR;
++    *(--dest) = '/';
+   }
+   return path;
+ }
+@@ -530,7 +537,13 @@
+   bool isDir = IsDir(p, be);
+   switch (propID)
+   {
+-    case kpidPath: prop = MultiByteToUnicodeString(GetPath(index), CP_OEMCP); break;
++    case kpidPath:
++    {
++      UString path;
++      if (!ConvertUTF8ToUnicode(GetPath(index), path)) return E_INVALIDARG;
++      prop = path;
++      break;
++    }
+     case kpidIsDir: prop = isDir; break;
+     // case kpidOffset: prop = (UInt32)GetOffset(p, be); break;
+     case kpidSize: if (!isDir) prop = GetSize(p, be); break;

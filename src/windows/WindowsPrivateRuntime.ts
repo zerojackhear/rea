@@ -1,4 +1,5 @@
 import { win32 } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 
 import { z } from "zod";
 import { PrivateRuntimeRootUnavailableError } from "../process/PrivateRuntimeRootUnavailableError.js";
@@ -31,6 +32,13 @@ const transientRuntimeAdmissionSchema = z.object({
   win32Code: z.union([z.literal(32), z.literal(33)]),
   runtimeAllocation: z.literal("not-started"),
 });
+
+const transientSnapshotAdmissionSchema = z.object({
+  code: z.literal("ERR_REA_WINDOWS_NATIVE"),
+  win32Code: z.union([z.literal(32), z.literal(33)]),
+  snapshotAllocation: z.literal("not-started"),
+});
+const SNAPSHOT_ADMISSION_RETRY_DELAYS_MS = [25, 75, 150] as const;
 
 /** Retain private DACL and path handles until native recursive cleanup settles. */
 export class WindowsPrivateRuntime {
@@ -68,6 +76,26 @@ export class WindowsPrivateRuntime {
     return runtime;
   }
 
+  /** Seal the runtime into fixed engine/input/output AppContainer roles. */
+  prepareAppContainer() {
+    if (this.authority.inspection.appContainer !== true)
+      throw new Error(
+        "The packaged Windows native artifact has no AppContainer support",
+      );
+    return z
+      .strictObject({
+        profile: z.string().startsWith("REA.Firmware."),
+        profilePath: z.string(),
+        capabilities: z.literal(0),
+        childProcesses: z.literal(false),
+      })
+      .parse(
+        this.authority.call("runtime_prepare_appcontainer", [
+          this.observation.handle,
+        ]),
+      );
+  }
+
   /** Open a private child directory through retained, verified parent handles. */
   mkdir(relativePath: string): void {
     this.authority.call("runtime_mkdir", [
@@ -90,15 +118,33 @@ export class WindowsPrivateRuntime {
     sourcePath: string,
     relativePath: string,
     signal?: AbortSignal,
+    maxBytes?: number,
   ): Promise<z.infer<typeof snapshotSchema>> {
-    // Admission is synchronous; record ownership only after native acceptance.
-    const pending = Promise.resolve(
-      this.authority.call("runtime_snapshot", [
-        this.observation.handle,
-        sourcePath,
-        relativePath,
-      ]),
-    );
+    // Only source admission may be retried. An accepted copy, destination
+    // conflict, permission failure, or unknown allocation is never replayed.
+    let accepted: unknown;
+    for (let attempt = 0; ; attempt++) {
+      signal?.throwIfAborted();
+      try {
+        accepted = this.authority.call("runtime_snapshot", [
+          this.observation.handle,
+          sourcePath,
+          relativePath,
+          ...(maxBytes === undefined ? [] : [maxBytes]),
+        ]);
+        break;
+      } catch (cause: unknown) {
+        const waitMs = SNAPSHOT_ADMISSION_RETRY_DELAYS_MS[attempt];
+        if (
+          waitMs === undefined ||
+          !transientSnapshotAdmissionSchema.safeParse(cause).success
+        )
+          throw cause;
+        await delay(waitMs, undefined, { signal });
+      }
+    }
+    // Native acceptance is synchronous; attach cancellation before awaiting it.
+    const pending = Promise.resolve(accepted);
     this.#pending = pending;
     const cancel = (): void => {
       this.authority.call("runtime_snapshot_cancel", [this.observation.handle]);

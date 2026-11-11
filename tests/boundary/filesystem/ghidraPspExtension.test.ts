@@ -1,5 +1,5 @@
 import { mkdir, rename, symlink, truncate, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 import { parseConfig } from "../../../src/config/parseConfig.js";
@@ -39,7 +39,7 @@ const target = {
   format: "elf",
   architecture: "mips",
   availableArchitectures: ["mips"],
-  path: "/caller/psp.elf",
+  path: resolve("caller/psp.elf"),
   sha256: "a".repeat(64),
   mips: {
     elfClass: 32,
@@ -51,16 +51,16 @@ const target = {
   },
 } satisfies BinaryTarget;
 const host: GhidraInstallationHost = {
-  platform: "linux",
+  platform: process.platform === "win32" ? "win32" : "linux",
   architecture: "x64",
   readText: () => "application.version=12.1.3\napplication.java.min=21\n",
   executable: () => true,
   probeJava: () => ({
     osArch: "amd64",
-    osName: "Linux",
+    osName: process.platform === "win32" ? "Windows 11" : "Linux",
     version: "21.0.12",
     major: 21,
-    home: "/jdk-21",
+    home: resolve("fixture-jdk-21"),
     bits: 64,
     runtime: "jdk",
   }),
@@ -92,132 +92,130 @@ async function installation() {
   };
 }
 
-describe.skipIf(process.platform === "win32")(
-  "PSP installed-extension and profile boundary",
-  () => {
-    it("binds source interpretation and installed content, not mtimes or discovery order", async () => {
-      const { provider, root } = await installation();
-      expect(provider.inspectTargetSupport(target).status).toBe("supported");
-      const first = await provider.resolveAnalysisProfile(target);
-      if (!first.ok) throw first.error;
-      const again = await provider.resolveAnalysisProfile(target);
-      if (!again.ok) throw again.error;
-      expect(again.value.profile?.digest).toBe(first.value.profile?.digest);
-      expect(first.value.profile?.parameters).toMatchObject({
-        architecture: "mips",
-        language_id: "Allegrex:LE:32:default",
-        compiler_spec_id: "default",
-        loader: "PspElfLoader",
-        mips_support_lane: "psp-elf32-exec-eabi32-allegrex-v2",
-        mips_elf: {
-          elf_class: 32,
-          byte_order: "little",
-          type: 2,
-          flags: 0x10a23001,
-          abi_flags: {
-            version: 0,
-            isa_level: 2,
-            isa_revision: 0,
-            gpr_size: 1,
-            cpr1_size: 1,
-            cpr2_size: 0,
-            fp_abi: 2,
-            isa_extension: 0,
-            ases: 0,
-            flags1: 1,
-            flags2: 0,
-          },
+describe("PSP installed-extension and profile boundary", () => {
+  it("binds source interpretation and installed content, not mtimes or discovery order", async () => {
+    const { provider, root } = await installation();
+    expect(provider.inspectTargetSupport(target).status).toBe("supported");
+    const first = await provider.resolveAnalysisProfile(target);
+    if (!first.ok) throw first.error;
+    const again = await provider.resolveAnalysisProfile(target);
+    if (!again.ok) throw again.error;
+    expect(again.value.profile?.digest).toBe(first.value.profile?.digest);
+    expect(first.value.profile?.parameters).toMatchObject({
+      architecture: "mips",
+      language_id: "Allegrex:LE:32:default",
+      compiler_spec_id: "default",
+      loader: "PspElfLoader",
+      mips_support_lane: "psp-elf32-exec-eabi32-allegrex-v2",
+      mips_elf: {
+        elf_class: 32,
+        byte_order: "little",
+        type: 2,
+        flags: 0x10a23001,
+        abi_flags: {
+          version: 0,
+          isa_level: 2,
+          isa_revision: 0,
+          gpr_size: 1,
+          cpr1_size: 1,
+          cpr2_size: 0,
+          fp_abi: 2,
+          isa_extension: 0,
+          ases: 0,
+          flags1: 1,
+          flags2: 0,
         },
-        psp_extension: {
-          id: "ghidra-allegrex",
-          root,
-          ghidra_version: "12.1.3",
-          sha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
-        },
-      });
-      await writeFile(
-        join(root, "data/languages/allegrex.sla"),
-        "changed processor semantics",
-      );
-      const changed = await provider.resolveAnalysisProfile(target);
-      if (!changed.ok) throw changed.error;
-      expect(changed.value.profile?.digest).not.toBe(
-        first.value.profile?.digest,
-      );
-    });
-
-    it("fails before starting a provider after resolved extension bytes change", async () => {
-      const { directory, root } = await installation();
-      const extension = await inspectGhidraPspExtension(root, "12.1.3");
-      await writeFile(join(root, "lib/extension.jar"), "changed loader");
-      const spawn = vi.fn();
-      const launcher = new GhidraHeadlessLauncher({
-        environment: {},
-        analyzeHeadlessPath: join(directory, "support/analyzeHeadless"),
-        javaHome: "/jdk-21",
-        bridgeScriptPath: "/packaged/ReaGhidraBridge.java",
-        pspExtension: extension,
-        spawnProcess: spawn,
-      });
-      const launched = await launcher.launch({
-        runtimeRoot: join(directory, "runtime"),
-        transport: "unix-socket",
-        endpointPath: join(directory, "socket"),
-        token: "test-only-token",
-        runId: "00000000-0000-4000-8000-000000000001",
-        targetPath: target.path,
-        targetSha256: target.sha256,
-        providerVersion: "12.1.3",
-        profileDigest: "b".repeat(64),
-      });
-      expect(launched.ok).toBe(false);
-      if (launched.ok)
-        throw new Error("Changed extension reached provider startup");
-      expect(launched.error.cause).toBeInstanceOf(Error);
-      expect(String(launched.error.cause)).toContain(
-        "changed since profile resolution",
-      );
-      expect(spawn).not.toHaveBeenCalled();
-    });
-
-    it("requires a fresh extension when a saved profile's installation has disappeared", async () => {
-      const { provider, root } = await installation();
-      const before = await provider.resolveAnalysisProfile(target);
-      if (!before.ok) throw before.error;
-      await rename(root, `${root}-removed`);
-      const missing = await provider.resolveAnalysisProfile(target);
-      expect(missing.ok).toBe(false);
-      if (missing.ok) throw new Error("Missing installation was accepted");
-      expect(missing.error.message).toContain("PSP_EXTENSION_UNAVAILABLE");
-    });
-
-    it.each([
-      ["name=other\nversion=12.1.3\n", "does not match"],
-      ["name=ghidra-allegrex\nversion=12.1.4\n", "does not match"],
-      ["name=ghidra-allegrex\nversion=12.1.\\uZZZZ\n", "Unicode escape"],
-    ])(
-      "rejects mismatched or malformed extension metadata %s",
-      async (properties, reason) => {
-        const { root } = await installation();
-        await writeFile(join(root, "extension.properties"), properties);
-        await expect(inspectGhidraPspExtension(root, "12.1.3")).rejects.toThrow(
-          reason,
-        );
       },
-    );
-
-    it("does not treat an uninstall marker or missing compiled language as installed", async () => {
-      const { root } = await installation();
-      await rename(
-        join(root, "Module.manifest"),
-        join(root, "Module.manifest.uninstalled"),
-      );
-      await expect(inspectGhidraPspExtension(root, "12.1.3")).rejects.toThrow(
-        "Module.manifest",
-      );
+      psp_extension: {
+        id: "ghidra-allegrex",
+        root,
+        ghidra_version: "12.1.3",
+        sha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
+      },
     });
+    await writeFile(
+      join(root, "data/languages/allegrex.sla"),
+      "changed processor semantics",
+    );
+    const changed = await provider.resolveAnalysisProfile(target);
+    if (!changed.ok) throw changed.error;
+    expect(changed.value.profile?.digest).not.toBe(first.value.profile?.digest);
+  });
 
-    it("rejects symlinked code instead of hashing an untracked external producer", async () => {
+  it("fails before starting a provider after resolved extension bytes change", async () => {
+    const { directory, root } = await installation();
+    const extension = await inspectGhidraPspExtension(root, "12.1.3");
+    await writeFile(join(root, "lib/extension.jar"), "changed loader");
+    const spawn = vi.fn();
+    const launcher = new GhidraHeadlessLauncher({
+      environment: {},
+      analyzeHeadlessPath: join(directory, "support/analyzeHeadless"),
+      javaHome: "/jdk-21",
+      bridgeScriptPath: "/packaged/ReaGhidraBridge.java",
+      pspExtension: extension,
+      spawnProcess: spawn,
+    });
+    const launched = await launcher.launch({
+      runtimeRoot: join(directory, "runtime"),
+      transport: "unix-socket",
+      endpointPath: join(directory, "socket"),
+      token: "test-only-token",
+      runId: "00000000-0000-4000-8000-000000000001",
+      targetPath: target.path,
+      targetSha256: target.sha256,
+      providerVersion: "12.1.3",
+      profileDigest: "b".repeat(64),
+    });
+    expect(launched.ok).toBe(false);
+    if (launched.ok)
+      throw new Error("Changed extension reached provider startup");
+    expect(launched.error.cause).toBeInstanceOf(Error);
+    expect(String(launched.error.cause)).toContain(
+      "changed since profile resolution",
+    );
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it("requires a fresh extension when a saved profile's installation has disappeared", async () => {
+    const { provider, root } = await installation();
+    const before = await provider.resolveAnalysisProfile(target);
+    if (!before.ok) throw before.error;
+    await rename(root, `${root}-removed`);
+    const missing = await provider.resolveAnalysisProfile(target);
+    expect(missing.ok).toBe(false);
+    if (missing.ok) throw new Error("Missing installation was accepted");
+    expect(missing.error.message).toContain("PSP_EXTENSION_UNAVAILABLE");
+  });
+
+  it.each([
+    ["name=other\nversion=12.1.3\n", "does not match"],
+    ["name=ghidra-allegrex\nversion=12.1.4\n", "does not match"],
+    ["name=ghidra-allegrex\nversion=12.1.\\uZZZZ\n", "Unicode escape"],
+  ])(
+    "rejects mismatched or malformed extension metadata %s",
+    async (properties, reason) => {
+      const { root } = await installation();
+      await writeFile(join(root, "extension.properties"), properties);
+      await expect(inspectGhidraPspExtension(root, "12.1.3")).rejects.toThrow(
+        reason,
+      );
+    },
+  );
+
+  it("does not treat an uninstall marker or missing compiled language as installed", async () => {
+    const { root } = await installation();
+    await rename(
+      join(root, "Module.manifest"),
+      join(root, "Module.manifest.uninstalled"),
+    );
+    await expect(inspectGhidraPspExtension(root, "12.1.3")).rejects.toThrow(
+      "Module.manifest",
+    );
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "rejects symlinked code instead of hashing an untracked external producer",
+    async () => {
       const { root, directory } = await installation();
       const path = join(root, "lib/extension.jar");
       await rename(path, join(directory, "external.jar"));
@@ -225,106 +223,110 @@ describe.skipIf(process.platform === "win32")(
       await expect(inspectGhidraPspExtension(root, "12.1.3")).rejects.toThrow(
         "regular files",
       );
-    });
+    },
+  );
 
-    it("bounds sparse extension input before reading or allocating its declared extent", async () => {
-      const { root } = await installation();
-      await truncate(join(root, "lib/extension.jar"), 64 * 1024 * 1024 + 1);
+  it.runIf(process.platform === "win32")(
+    "rejects a junction to external extension code",
+    async () => {
+      const { root, directory } = await installation();
+      const library = join(root, "lib");
+      const external = join(directory, "external-lib");
+      await rename(library, external);
+      await symlink(external, library, "junction");
       await expect(inspectGhidraPspExtension(root, "12.1.3")).rejects.toThrow(
-        "inspection limit",
+        "regular files",
       );
-    });
-  },
-);
+    },
+  );
 
-describe.skipIf(process.platform === "win32")(
-  "PSP extension inventory bounds",
-  () => {
-    it.each([1, 2])(
-      "bounds the total inventory across %i directories",
-      async (directories) => {
-        const { root } = await installation();
-        for (let directory = 0; directory < directories; directory++) {
-          const path = join(root, `inventory-${directory}`);
-          await mkdir(path);
-          await Promise.all(
-            Array.from({ length: 1024 / directories }, (_, index) =>
-              writeFile(join(path, `entry-${index}`), ""),
-            ),
-          );
-        }
-        await expect(inspectGhidraPspExtension(root, "12.1.3")).rejects.toThrow(
-          "inventory exceeds the inspection limit",
-        );
-      },
+  it("bounds sparse extension input before reading or allocating its declared extent", async () => {
+    const { root } = await installation();
+    await truncate(join(root, "lib/extension.jar"), 64 * 1024 * 1024 + 1);
+    await expect(inspectGhidraPspExtension(root, "12.1.3")).rejects.toThrow(
+      "inspection limit",
     );
-  },
-);
+  });
+});
 
-describe.skipIf(process.platform === "win32")(
-  "PSP admission failures and explicit loader",
-  () => {
-    it("preserves already-aborted cancellation rather than reporting missing prerequisites", async () => {
-      const { provider } = await installation();
-      const result = await provider.resolveAnalysisProfile(target, {
-        signal: AbortSignal.abort(),
-      });
-      expect(result.ok).toBe(false);
-      if (result.ok) throw new Error("Cancellation was ignored");
-      expect(result.error._tag).toBe("AnalysisCancelledError");
-    });
-
-    it("does not broaden the separately verified host platforms", async () => {
-      const { config } = await installation();
-      for (const platform of ["darwin", "win32"] as const) {
-        const provider = new GhidraProvider(
-          config,
-          silentLogger,
-          {},
-          { ...host, platform },
-        );
-        expect(provider.inspectTargetSupport(target).status).toBe(
-          "unsupported",
+describe("PSP extension inventory bounds", () => {
+  it.each([1, 2])(
+    "bounds the total inventory across %i directories",
+    async (directories) => {
+      const { root } = await installation();
+      for (let directory = 0; directory < directories; directory++) {
+        const path = join(root, `inventory-${directory}`);
+        await mkdir(path);
+        await Promise.all(
+          Array.from({ length: 1024 / directories }, (_, index) =>
+            writeFile(join(path, `entry-${index}`), ""),
+          ),
         );
       }
+      await expect(inspectGhidraPspExtension(root, "12.1.3")).rejects.toThrow(
+        "inventory exceeds the inspection limit",
+      );
+    },
+  );
+});
+
+describe("PSP admission failures and explicit loader", () => {
+  it("preserves already-aborted cancellation rather than reporting missing prerequisites", async () => {
+    const { provider } = await installation();
+    const result = await provider.resolveAnalysisProfile(target, {
+      signal: AbortSignal.abort(),
     });
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("Cancellation was ignored");
+    expect(result.error._tag).toBe("AnalysisCancelledError");
+  });
 
-    it.each([
-      [{ byteOrder: "big" }, "little-endian"],
-      [{ elfClass: 64 }, "ELF32"],
-      [{ type: 0xffa0 }, "ET_EXEC"],
-      [{ flags: 0x12a23001 }, "0x10a23001"],
-      [{ flags: 0x10a23021 }, "0x10a23001"],
-    ])(
-      "refuses unverified PSP declarations %j before extension reads",
-      async (change, reason) => {
-        const { provider } = await installation();
-        const altered = {
-          ...target,
-          mips: { ...target.mips, ...change },
-        } as BinaryTarget;
-        expect(ghidraProcessorUnsupportedReason(altered)).toContain(reason);
-        expect(provider.inspectTargetSupport(altered).status).toBe(
-          "unsupported",
-        );
-        const result = await provider.resolveAnalysisProfile(altered);
-        expect(result.ok).toBe(false);
-        if (result.ok) throw new Error("Invalid target was admitted");
-        expect(result.error._tag).toBe("AnalysisUnsupportedTargetError");
-      },
-    );
+  it("does not broaden the separately verified host platforms", async () => {
+    const { config } = await installation();
+    for (const platform of ["darwin", "freebsd"] as const) {
+      const provider = new GhidraProvider(
+        config,
+        silentLogger,
+        {},
+        { ...host, platform },
+      );
+      expect(provider.inspectTargetSupport(target).status).toBe("unsupported");
+    }
+  });
 
-    it("refuses a separately declared unsupported MSA argument ABI", async () => {
+  it.each([
+    [{ byteOrder: "big" }, "little-endian"],
+    [{ elfClass: 64 }, "ELF32"],
+    [{ type: 0xffa0 }, "ET_EXEC"],
+    [{ flags: 0x12a23001 }, "0x10a23001"],
+    [{ flags: 0x10a23021 }, "0x10a23001"],
+  ])(
+    "refuses unverified PSP declarations %j before extension reads",
+    async (change, reason) => {
       const { provider } = await installation();
       const altered = {
         ...target,
-        mips: { ...target.mips, gnuAttributes: { fpAbi: 2, msa: 1 } },
+        mips: { ...target.mips, ...change },
       } as BinaryTarget;
-      expect(ghidraProcessorUnsupportedReason(altered)).toMatch(/MSA ABI/u);
+      expect(ghidraProcessorUnsupportedReason(altered)).toContain(reason);
       expect(provider.inspectTargetSupport(altered).status).toBe("unsupported");
-    });
-  },
-);
+      const result = await provider.resolveAnalysisProfile(altered);
+      expect(result.ok).toBe(false);
+      if (result.ok) throw new Error("Invalid target was admitted");
+      expect(result.error._tag).toBe("AnalysisUnsupportedTargetError");
+    },
+  );
+
+  it("refuses a separately declared unsupported MSA argument ABI", async () => {
+    const { provider } = await installation();
+    const altered = {
+      ...target,
+      mips: { ...target.mips, gnuAttributes: { fpAbi: 2, msa: 1 } },
+    } as BinaryTarget;
+    expect(ghidraProcessorUnsupportedReason(altered)).toMatch(/MSA ABI/u);
+    expect(provider.inspectTargetSupport(altered).status).toBe("unsupported");
+  });
+});
 
 /**
  * A PSPSDK-shaped ELF32 whose PT_MIPS_ABIFLAGS record matches the PSP profile.
@@ -359,236 +361,223 @@ const pspElfBytes = ({ sectionHeadersBeyondEof = false } = {}): Buffer => {
   return bytes;
 };
 
-describe.skipIf(process.platform === "win32")(
-  "PSP inspected ABI declaration boundary",
-  () => {
-    it("refuses a PSP image whose section headers lie beyond the captured file", async () => {
-      const { directory, provider } = await installation();
-      const path = join(directory, "psp-truncated-sections.elf");
-      await writeFile(path, pspElfBytes({ sectionHeadersBeyondEof: true }));
-      const parsed = await parseBinaryTarget(path);
-      if (!parsed.ok) throw parsed.error;
-      if (
-        parsed.value.kind !== "executable" ||
-        parsed.value.architecture !== "mips"
-      )
-        throw new Error("PSP ELF was not recognized as MIPS");
-      expect(parsed.value.mips.abiFlags).toEqual(pspAbiFlags);
-      expect(parsed.value.mips.limitations).toContainEqual(
-        expect.stringContaining("ABI declarations in unavailable headers"),
-      );
-      expect(provider.inspectTargetSupport(parsed.value).status).toBe(
-        "unsupported",
-      );
-      const result = await provider.resolveAnalysisProfile(parsed.value);
+describe("PSP inspected ABI declaration boundary", () => {
+  it("refuses a PSP image whose section headers lie beyond the captured file", async () => {
+    const { directory, provider } = await installation();
+    const path = join(directory, "psp-truncated-sections.elf");
+    await writeFile(path, pspElfBytes({ sectionHeadersBeyondEof: true }));
+    const parsed = await parseBinaryTarget(path);
+    if (!parsed.ok) throw parsed.error;
+    if (
+      parsed.value.kind !== "executable" ||
+      parsed.value.architecture !== "mips"
+    )
+      throw new Error("PSP ELF was not recognized as MIPS");
+    expect(parsed.value.mips.abiFlags).toEqual(pspAbiFlags);
+    expect(parsed.value.mips.limitations).toContainEqual(
+      expect.stringContaining("ABI declarations in unavailable headers"),
+    );
+    expect(provider.inspectTargetSupport(parsed.value).status).toBe(
+      "unsupported",
+    );
+    const result = await provider.resolveAnalysisProfile(parsed.value);
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("Incomplete ABI inspection was admitted");
+    expect(result.error._tag).toBe("AnalysisUnsupportedTargetError");
+    expect(result.error.message).toContain(
+      "MIPS ABI declaration inspection is incomplete",
+    );
+  });
+
+  it("retains independently inspected PSP ABI bytes through the real target reader", async () => {
+    const { directory, provider } = await installation();
+    const bytes = pspElfBytes();
+    const path = join(directory, "psp-with-abi.elf");
+    await writeFile(path, bytes);
+    const parsed = await parseBinaryTarget(path);
+    if (!parsed.ok) throw parsed.error;
+    if (
+      parsed.value.kind !== "executable" ||
+      parsed.value.architecture !== "mips"
+    )
+      throw new Error("PSP ELF was not recognized as MIPS");
+    expect(parsed.value.mips.abiFlags).toEqual(pspAbiFlags);
+    expect(provider.inspectTargetSupport(parsed.value).status).toBe(
+      "supported",
+    );
+    const profile = await provider.resolveAnalysisProfile(parsed.value);
+    if (!profile.ok) throw profile.error;
+    expect(profile.value.profile?.parameters.mips_elf).toMatchObject({
+      flags: 0x10a23001,
+      abi_flags: { isa_level: 2, fp_abi: 2, flags1: 1 },
+    });
+  });
+
+  it.each([
+    ["version", 1],
+    ["isaLevel", 32],
+    ["isaRevision", 1],
+    ["gprSize", 2],
+    ["cpr1Size", 2],
+    ["cpr2Size", 1],
+    ["fpAbi", 1],
+    ["fpAbi", 3],
+    ["fpAbi", 5],
+    ["isaExtension", 1],
+    ["ases", 1],
+    ["flags1", 0],
+    ["flags1", 3],
+    ["flags2", 1],
+  ] satisfies [keyof MipsAbiFlags, number][])(
+    "rejects unverified PSP ABI field %s=%i before extension discovery",
+    async (field, value) => {
+      const { provider, root } = await installation();
+      await rename(root, `${root}-unavailable`);
+      const altered: Extract<BinaryTarget, { architecture: "mips" }> = {
+        ...target,
+        mips: {
+          elfClass: 32,
+          byteOrder: "little",
+          type: 2,
+          flags: 0x10a23001,
+          gnuAttributes: null,
+          abiFlags: { ...pspAbiFlags, [field]: value },
+        },
+      };
+      expect(provider.inspectTargetSupport(altered).status).toBe("unsupported");
+      const result = await provider.resolveAnalysisProfile(altered);
       expect(result.ok).toBe(false);
-      if (result.ok) throw new Error("Incomplete ABI inspection was admitted");
+      if (result.ok) throw new Error("Invalid ABI was admitted");
+      expect(result.error._tag).toBe("AnalysisUnsupportedTargetError");
+      expect(result.error.message).toContain("separate MIPS ABI flags record");
+    },
+  );
+
+  it.each([undefined, null])(
+    "does not guess an uninspected or absent PSP ABI record: %s",
+    async (abiFlags) => {
+      const { provider, root } = await installation();
+      await rename(root, `${root}-unavailable`);
+      const altered: Extract<BinaryTarget, { architecture: "mips" }> = {
+        ...target,
+        mips: {
+          elfClass: 32,
+          byteOrder: "little",
+          type: 2,
+          flags: 0x10a23001,
+          gnuAttributes: null,
+          ...(abiFlags === undefined ? {} : { abiFlags }),
+        },
+      };
+      const result = await provider.resolveAnalysisProfile(altered);
+      expect(result.ok).toBe(false);
+      if (result.ok) throw new Error("Missing ABI was inferred");
       expect(result.error._tag).toBe("AnalysisUnsupportedTargetError");
       expect(result.error.message).toContain(
-        "MIPS ABI declaration inspection is incomplete",
+        "inspected separate MIPS ABI flags record",
       );
-    });
+    },
+  );
+});
 
-    it("retains independently inspected PSP ABI bytes through the real target reader", async () => {
-      const { directory, provider } = await installation();
-      const bytes = pspElfBytes();
-      const path = join(directory, "psp-with-abi.elf");
-      await writeFile(path, bytes);
-      const parsed = await parseBinaryTarget(path);
-      if (!parsed.ok) throw parsed.error;
-      if (
-        parsed.value.kind !== "executable" ||
-        parsed.value.architecture !== "mips"
-      )
-        throw new Error("PSP ELF was not recognized as MIPS");
-      expect(parsed.value.mips.abiFlags).toEqual(pspAbiFlags);
-      expect(provider.inspectTargetSupport(parsed.value).status).toBe(
-        "supported",
-      );
-      const profile = await provider.resolveAnalysisProfile(parsed.value);
-      if (!profile.ok) throw profile.error;
-      expect(profile.value.profile?.parameters.mips_elf).toMatchObject({
-        flags: 0x10a23001,
-        abi_flags: { isa_level: 2, fp_abi: 2, flags1: 1 },
-      });
+describe("PSP explicit loader boundary", () => {
+  it("rejects mixing the PSP loader with a configured generic processor", async () => {
+    const { directory } = await installation();
+    const config = parseConfig({
+      GHIDRA_INSTALL_DIR: directory,
+      REA_GHIDRA_LANGUAGE_ID: "x86:LE:64:default",
     });
-
-    it.each([
-      ["version", 1],
-      ["isaLevel", 32],
-      ["isaRevision", 1],
-      ["gprSize", 2],
-      ["cpr1Size", 2],
-      ["cpr2Size", 1],
-      ["fpAbi", 1],
-      ["fpAbi", 3],
-      ["fpAbi", 5],
-      ["isaExtension", 1],
-      ["ases", 1],
-      ["flags1", 0],
-      ["flags1", 3],
-      ["flags2", 1],
-    ] satisfies [keyof MipsAbiFlags, number][])(
-      "rejects unverified PSP ABI field %s=%i before extension discovery",
-      async (field, value) => {
-        const { provider, root } = await installation();
-        await rename(root, `${root}-unavailable`);
-        const altered: Extract<BinaryTarget, { architecture: "mips" }> = {
-          ...target,
-          mips: {
-            elfClass: 32,
-            byteOrder: "little",
-            type: 2,
-            flags: 0x10a23001,
-            gnuAttributes: null,
-            abiFlags: { ...pspAbiFlags, [field]: value },
-          },
-        };
-        expect(provider.inspectTargetSupport(altered).status).toBe(
-          "unsupported",
-        );
-        const result = await provider.resolveAnalysisProfile(altered);
-        expect(result.ok).toBe(false);
-        if (result.ok) throw new Error("Invalid ABI was admitted");
-        expect(result.error._tag).toBe("AnalysisUnsupportedTargetError");
-        expect(result.error.message).toContain(
-          "separate MIPS ABI flags record",
-        );
-      },
+    if (!config.ok) throw config.error;
+    const provider = new GhidraProvider(config.value, silentLogger, {}, host);
+    const result = await provider.resolveAnalysisProfile(target);
+    expect(result.ok).toBe(false);
+    if (result.ok)
+      throw new Error("Conflicting language override was accepted");
+    expect(result.error._tag).toBe("AnalysisUnsupportedTargetError");
+    expect(result.error.message).toContain(
+      "does not accept REA_GHIDRA_LANGUAGE_ID overrides",
     );
+  });
 
-    it.each([undefined, null])(
-      "does not guess an uninspected or absent PSP ABI record: %s",
-      async (abiFlags) => {
-        const { provider, root } = await installation();
-        await rename(root, `${root}-unavailable`);
-        const altered: Extract<BinaryTarget, { architecture: "mips" }> = {
-          ...target,
-          mips: {
-            elfClass: 32,
-            byteOrder: "little",
-            type: 2,
-            flags: 0x10a23001,
-            gnuAttributes: null,
-            ...(abiFlags === undefined ? {} : { abiFlags }),
-          },
-        };
-        const result = await provider.resolveAnalysisProfile(altered);
-        expect(result.ok).toBe(false);
-        if (result.ok) throw new Error("Missing ABI was inferred");
-        expect(result.error._tag).toBe("AnalysisUnsupportedTargetError");
-        expect(result.error.message).toContain(
-          "inspected separate MIPS ABI flags record",
-        );
-      },
+  it("keeps PSP and generic language-override launch paths mutually exclusive", () => {
+    const paths = {
+      projectRoot: "/project",
+      targetPath: "/target.elf",
+      bridgeScriptPath: "/bridge/Rea.java",
+      descriptorPath: "/session",
+      ghidraLogPath: "/log",
+      scriptLogPath: "/scriptlog",
+    };
+    const languageOverride = { languageId: "x86:LE:64:default" };
+    expect(() =>
+      ghidraHeadlessArguments({ ...paths, psp: true, languageOverride }),
+    ).toThrow("PSP ELF import cannot be combined");
+    expect(ghidraHeadlessArguments({ ...paths, languageOverride })).toEqual(
+      expect.arrayContaining(["-processor", "x86:LE:64:default"]),
     );
-  },
-);
-
-describe.skipIf(process.platform === "win32")(
-  "PSP explicit loader boundary",
-  () => {
-    it("rejects mixing the PSP loader with a configured generic processor", async () => {
-      const { directory } = await installation();
-      const config = parseConfig({
-        GHIDRA_INSTALL_DIR: directory,
-        REA_GHIDRA_LANGUAGE_ID: "x86:LE:64:default",
-      });
-      if (!config.ok) throw config.error;
-      const provider = new GhidraProvider(config.value, silentLogger, {}, host);
-      const result = await provider.resolveAnalysisProfile(target);
-      expect(result.ok).toBe(false);
-      if (result.ok)
-        throw new Error("Conflicting language override was accepted");
-      expect(result.error._tag).toBe("AnalysisUnsupportedTargetError");
-      expect(result.error.message).toContain(
-        "does not accept REA_GHIDRA_LANGUAGE_ID overrides",
-      );
-    });
-
-    it("keeps PSP and generic language-override launch paths mutually exclusive", () => {
-      const paths = {
-        projectRoot: "/project",
-        targetPath: "/target.elf",
-        bridgeScriptPath: "/bridge/Rea.java",
-        descriptorPath: "/session",
-        ghidraLogPath: "/log",
-        scriptLogPath: "/scriptlog",
-      };
-      const languageOverride = { languageId: "x86:LE:64:default" };
-      expect(() =>
-        ghidraHeadlessArguments({ ...paths, psp: true, languageOverride }),
-      ).toThrow("PSP ELF import cannot be combined");
-      expect(ghidraHeadlessArguments({ ...paths, languageOverride })).toEqual(
-        expect.arrayContaining(["-processor", "x86:LE:64:default"]),
-      );
-      expect(ghidraHeadlessArguments({ ...paths, psp: true })).toEqual(
-        expect.arrayContaining([
-          "-loader",
-          "PspElfLoader",
-          "-processor",
-          "Allegrex:LE:32:default",
-        ]),
-      );
-    });
-
-    it("forces the PSP loader/language only for the selected profile", () => {
-      const paths = {
-        projectRoot: "/project",
-        targetPath: "/target.elf",
-        bridgeScriptPath: "/bridge/Rea.java",
-        descriptorPath: "/session",
-        ghidraLogPath: "/log",
-        scriptLogPath: "/scriptlog",
-      };
-      expect(ghidraHeadlessArguments({ ...paths, psp: true })).toEqual(
-        expect.arrayContaining([
-          "-loader",
-          "PspElfLoader",
-          "-processor",
-          "Allegrex:LE:32:default",
-          "-cspec",
-          "default",
-        ]),
-      );
-      expect(ghidraHeadlessArguments(paths)).not.toContain(
+    expect(ghidraHeadlessArguments({ ...paths, psp: true })).toEqual(
+      expect.arrayContaining([
+        "-loader",
+        "PspElfLoader",
+        "-processor",
         "Allegrex:LE:32:default",
-      );
-    });
-  },
-);
-
-describe.skipIf(process.platform === "win32")(
-  "PSP extension property syntax",
-  () => {
-    it.each([
-      {
-        form: "escaped key and value with colon separator",
-        properties: "n\\u0061me : ghidra-allegrex\nver\\u0073ion=12.1.3\n",
-      },
-      {
-        form: "continued key and value lines",
-        properties: "name=ghidra-\\\n allegrex\nversion=12.1.\\\n 3\n",
-      },
-      {
-        form: "duplicate keys use the last value",
-        properties:
-          "name=wrong\nname=ghidra-allegrex\nversion=12.1.4\nversion=12.1.3\n",
-      },
-    ])(
-      "accepts Java Properties $form and hashes raw bytes",
-      async ({ properties }) => {
-        const { root } = await installation();
-        const canonical = await inspectGhidraPspExtension(root, "12.1.3");
-        const latin1Properties = Buffer.from(
-          `${properties}author=caf\u00e9\n`,
-          "latin1",
-        );
-        await writeFile(join(root, "extension.properties"), latin1Properties);
-        const extension = await inspectGhidraPspExtension(root, "12.1.3");
-        expect(extension.id).toBe("ghidra-allegrex");
-        expect(extension.sha256).not.toBe(canonical.sha256);
-      },
+      ]),
     );
-  },
-);
+  });
+
+  it("forces the PSP loader/language only for the selected profile", () => {
+    const paths = {
+      projectRoot: "/project",
+      targetPath: "/target.elf",
+      bridgeScriptPath: "/bridge/Rea.java",
+      descriptorPath: "/session",
+      ghidraLogPath: "/log",
+      scriptLogPath: "/scriptlog",
+    };
+    expect(ghidraHeadlessArguments({ ...paths, psp: true })).toEqual(
+      expect.arrayContaining([
+        "-loader",
+        "PspElfLoader",
+        "-processor",
+        "Allegrex:LE:32:default",
+        "-cspec",
+        "default",
+      ]),
+    );
+    expect(ghidraHeadlessArguments(paths)).not.toContain(
+      "Allegrex:LE:32:default",
+    );
+  });
+});
+
+describe("PSP extension property syntax", () => {
+  it.each([
+    {
+      form: "escaped key and value with colon separator",
+      properties: "n\\u0061me : ghidra-allegrex\nver\\u0073ion=12.1.3\n",
+    },
+    {
+      form: "continued key and value lines",
+      properties: "name=ghidra-\\\n allegrex\nversion=12.1.\\\n 3\n",
+    },
+    {
+      form: "duplicate keys use the last value",
+      properties:
+        "name=wrong\nname=ghidra-allegrex\nversion=12.1.4\nversion=12.1.3\n",
+    },
+  ])(
+    "accepts Java Properties $form and hashes raw bytes",
+    async ({ properties }) => {
+      const { root } = await installation();
+      const canonical = await inspectGhidraPspExtension(root, "12.1.3");
+      const latin1Properties = Buffer.from(
+        `${properties}author=caf\u00e9\n`,
+        "latin1",
+      );
+      await writeFile(join(root, "extension.properties"), latin1Properties);
+      const extension = await inspectGhidraPspExtension(root, "12.1.3");
+      expect(extension.id).toBe("ghidra-allegrex");
+      expect(extension.sha256).not.toBe(canonical.sha256);
+    },
+  );
+});

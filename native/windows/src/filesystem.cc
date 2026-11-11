@@ -450,6 +450,28 @@ static void directory(Runtime& root, const std::wstring& relative) {
   }
 }
 
+static std::unique_ptr<File> openRuntimeFile(Runtime& root, const std::wstring& path) {
+  auto file = runtimeDirectory(root, path.substr(0, path.find_last_of(L'\\')));
+  file->path = path;
+  file->requestedPath = path;
+  // Retained output handles have write and DELETE access, so this read open
+  // must share both to pass Windows' symmetric share check. Those retained
+  // handles still omit FILE_SHARE_WRITE and FILE_SHARE_DELETE, blocking
+  // competing writes and delete opens.
+  auto child = openRelative(file->get(), path.substr(path.find_last_of(L'\\') + 1),
+                GENERIC_READ | FILE_READ_ATTRIBUTES | READ_CONTROL,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_NON_DIRECTORY_FILE, path);
+  FILE_ATTRIBUTE_TAG_INFO info{};
+  require(GetFileInformationByHandleEx(child.get(), FileAttributeTagInfo, &info, sizeof(info)),
+      "Read private file tag failed", path);
+  require((info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0,
+      "Reparse private file is unsupported", path, ERROR_NOT_SUPPORTED);
+  file->handles.push_back(std::move(child));
+  verifyPrivate(file->get(), path, false);
+  return file;
+}
+
 static Handle createPrivateFile(Runtime& root, const std::wstring& relative,
                                 DWORD access = DELETE | GENERIC_WRITE | GENERIC_READ | READ_CONTROL) {
   const auto path = relativePath(root, relative);
@@ -504,9 +526,147 @@ static void disposeSnapshot(Runtime& root, Handle& file, const std::wstring& pat
   dispose(cleanup.get(), path);
 }
 
+// Preparation is a one-way transition. Only this newly created profile SID
+// receives access; it cannot mutate input/engine bytes or create child processes.
+static void grantSandboxObject(HANDLE handle, const std::wstring& path, PSID sid,
+                               DWORD access, bool directory, bool writable) {
+  Security owner;
+  const DWORD flags = directory ? OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE : 0;
+  std::vector<unsigned char> acl(sizeof(ACL) + 4 * (sizeof(ACCESS_ALLOWED_ACE) - sizeof(DWORD)) +
+      GetLengthSid(owner.userSid()) + GetLengthSid(owner.system.data()) + 2 * GetLengthSid(sid));
+  auto dacl = reinterpret_cast<PACL>(acl.data());
+  require(InitializeAcl(dacl, static_cast<DWORD>(acl.size()), ACL_REVISION), "Initialize AppContainer DACL failed", path);
+  for (PSID principal : {owner.userSid(), static_cast<PSID>(owner.system.data())})
+    require(AddAccessAllowedAceEx(dacl, ACL_REVISION, flags, FILE_ALL_ACCESS, principal),
+            "Retain AppContainer owner access failed", path);
+  require(AddAccessAllowedAceEx(dacl, ACL_REVISION, flags, access, sid), "Grant AppContainer role failed", path);
+  if (directory)
+    require(AddAccessAllowedAceEx(dacl, ACL_REVISION, CONTAINER_INHERIT_ACE, FILE_TRAVERSE, sid),
+            "Grant AppContainer directory traversal failed", path);
+  const auto status = SetSecurityInfo(handle, SE_FILE_OBJECT,
+      DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+      nullptr, nullptr, dacl, nullptr);
+  require(status == ERROR_SUCCESS, "Apply AppContainer DACL by handle failed", path, status);
+  if (writable) {
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    require(ConvertStringSecurityDescriptorToSecurityDescriptorW(L"S:(ML;OICI;NW;;;LW)", SDDL_REVISION_1,
+                                                                &descriptor, nullptr), "Create low-integrity label failed", path);
+    struct Local { PSECURITY_DESCRIPTOR value; ~Local() { LocalFree(value); } } sd{descriptor};
+    PACL label = nullptr; BOOL present = FALSE, inherited = FALSE;
+    require(GetSecurityDescriptorSacl(descriptor, &present, &label, &inherited) && present,
+            "Read low-integrity label failed", path);
+    const auto applied = SetSecurityInfo(handle, SE_FILE_OBJECT, LABEL_SECURITY_INFORMATION,
+                                         nullptr, nullptr, nullptr, label);
+    require(applied == ERROR_SUCCESS, "Apply writable AppContainer label failed", path, applied);
+  }
+}
+
+static void grantSandboxTree(HANDLE parent, const std::wstring& name, const std::wstring& path,
+                             PSID sid, DWORD access, bool writable, size_t& count, std::vector<Handle>& leases, size_t depth = 0) {
+  require(++count <= 16384 && depth <= 64, "AppContainer runtime tree exceeds admission bound", path, ERROR_BUFFER_OVERFLOW);
+  auto file = openRelative(parent, name, FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC | WRITE_OWNER,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, 0, path);
+  FILE_ATTRIBUTE_TAG_INFO info{};
+  require(GetFileInformationByHandleEx(file.get(), FileAttributeTagInfo, &info, sizeof(info)), "Read AppContainer object type failed", path);
+  require((info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0, "AppContainer tree contains a reparse object", path, ERROR_ACCESS_DENIED);
+  const bool directory = (info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+  grantSandboxObject(file.get(), path, sid, access, directory, writable);
+  if (!directory) return;
+  alignas(FILE_ID_BOTH_DIR_INFO) std::array<unsigned char, 1024> data{};
+  bool restart = true;
+  for (;;) {
+    if (!GetFileInformationByHandleEx(file.get(), restart ? FileIdBothDirectoryRestartInfo : FileIdBothDirectoryInfo,
+                                      data.data(), static_cast<DWORD>(data.size()))) {
+      const auto error = GetLastError();
+      if (error == ERROR_NO_MORE_FILES) break;
+      throw Failure("Enumerate AppContainer tree by handle failed", path, error);
+    }
+    restart = false;
+    size_t offset = 0;
+    for (;;) {
+      require(offset <= data.size() - offsetof(FILE_ID_BOTH_DIR_INFO, FileName), "Truncated AppContainer directory record", path, ERROR_INVALID_DATA);
+      const auto* entry = reinterpret_cast<const FILE_ID_BOTH_DIR_INFO*>(data.data() + offset);
+      require(entry->FileNameLength % sizeof(wchar_t) == 0 &&
+                  entry->FileNameLength <= data.size() - offset - offsetof(FILE_ID_BOTH_DIR_INFO, FileName),
+              "Truncated AppContainer filename", path, ERROR_INVALID_DATA);
+      const std::wstring child(entry->FileName, entry->FileNameLength / sizeof(wchar_t));
+      if (child != L"." && child != L"..")
+        grantSandboxTree(file.get(), child, path + L"\\" + child, sid, access, writable, count, leases, depth + 1);
+      if (entry->NextEntryOffset == 0) break;
+      require(entry->NextEntryOffset % alignof(FILE_ID_BOTH_DIR_INFO) == 0 &&
+                  entry->NextEntryOffset >= offsetof(FILE_ID_BOTH_DIR_INFO, FileName) + entry->FileNameLength &&
+                  entry->NextEntryOffset <= data.size() - offset - offsetof(FILE_ID_BOTH_DIR_INFO, FileName),
+              "Invalid AppContainer directory offset", path, ERROR_INVALID_DATA);
+      offset += entry->NextEntryOffset;
+    }
+  }
+  leases.push_back(std::move(file));
+}
+
+static void sealRuntimeReaders(Runtime& root) {
+  for (auto& writer : root.immutableFiles) {
+    // A read lease is acquired before releasing the writer; deletion and
+    // replacement remain denied throughout. Then acquire a deny-write reader.
+    Handle reader(ReOpenFile(writer.get(), GENERIC_READ | READ_CONTROL,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE, 0));
+    require(reader.valid(), "Acquire AppContainer read lease failed", root.path);
+    writer.reset();
+    writer.reset(ReOpenFile(reader.get(), GENERIC_READ | READ_CONTROL, FILE_SHARE_READ, 0));
+    if (!writer.valid()) {
+      writer = std::move(reader);
+      throw Failure("Seal AppContainer immutable bytes failed", root.path);
+    }
+  }
+}
+
+static napi_value prepareSandbox(napi_env env, Runtime& root) {
+  require(!root.sandbox, "Runtime already entered AppContainer preparation", root.path, ERROR_INVALID_PARAMETER);
+  root.sandbox = std::make_shared<Sandbox>();
+  root.sandbox->create();
+  sealRuntimeReaders(root);
+  size_t count = 0;
+  const auto sid = root.sandbox->sid.data();
+  for (const auto& name : {L"engine", L"input", L"output"}) {
+    const bool writable = std::wstring(name) == L"output";
+    const DWORD access = std::wstring(name) == L"engine" ? FILE_GENERIC_READ | FILE_GENERIC_EXECUTE
+                      : writable ? FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE | FILE_DELETE_CHILD
+                                 : FILE_GENERIC_READ;
+    grantSandboxTree(root.directory.get(), name, root.path + L"\\" + name, sid, access, writable, count, root.sandbox->directoryLeases);
+  }
+  // Profile storage is also read-only: the native provider gets writable
+  // output only in the explicit, metered output subtree.
+  const auto profile = localPath(root.sandbox->profilePath);
+  auto parent = openFile(profile.substr(0, profile.find_last_of(L'\\')),
+                         FILE_LIST_DIRECTORY | READ_CONTROL, true);
+  grantSandboxTree(parent->get(), profile.substr(profile.find_last_of(L'\\') + 1), profile,
+                    sid, FILE_GENERIC_READ, false, count, root.sandbox->directoryLeases);
+  auto rootAccess = openRelative(root.parents.back().get(), root.path.substr(root.path.find_last_of(L'\\') + 1),
+                                 WRITE_DAC | READ_CONTROL, FILE_SHARE_READ | FILE_SHARE_DELETE,
+                                 FILE_DIRECTORY_FILE, root.path);
+  grantSandboxObject(rootAccess.get(), root.path, sid, FILE_TRAVERSE, false, false);
+  root.sandbox->ready = true;
+  auto result = object(env);
+  set(env, result, "profile", string(env, root.sandbox->name));
+  set(env, result, "profilePath", string(env, root.sandbox->profilePath));
+  set(env, result, "capabilities", number(env, 0));
+  set(env, result, "childProcesses", boolean(env, false));
+  return result;
+}
+
+void admitSandboxLaunch(Runtime& root, const std::wstring& command, const std::wstring& cwd) {
+  require(root.sandbox && root.sandbox->ready && !root.closing && !root.closed,
+          "AppContainer workspace is not sealed", root.path, ERROR_ACCESS_DENIED);
+  const auto executable = localPath(command);
+  const auto base = root.path + L"\\engine\\";
+  require(executable.compare(0, base.size(), base) == 0 && localPath(cwd) == root.path + L"\\output",
+          "AppContainer launch must use its admitted engine and output directory", root.path, ERROR_ACCESS_DENIED);
+}
+
+
 void closeRuntime(Runtime& root) {
   if (root.closed) return;
   root.closing = true;
+  if (root.sandbox) root.sandbox->close();
   // Windows keeps the bearer descriptor and snapshot leases until this owner
   // cleanup. POSIX removes its consumed descriptor earlier. Abrupt owner death
   // closes process jobs but cannot run this walk, so private files can remain.
@@ -667,9 +827,23 @@ static void completeSnapshot(napi_env env, napi_status status, void* pointer) {
 }
 
 static napi_value snapshot(napi_env env, napi_value rootValue, Runtime& root,
-                           const std::wstring& sourcePath, const std::wstring& relative) {
+                           const std::wstring& sourcePath, const std::wstring& relative, double maximum = 9007199254740991.0) {
   auto work = std::make_unique<SnapshotWork>(env, root);
-  work->source = openFile(sourcePath);
+  const auto source = localPath(sourcePath);
+  const auto prefix = root.path + L"\\";
+  try {
+    work->source = source.compare(0, prefix.size(), prefix) == 0
+        ? openRuntimeFile(root, source) : openFile(sourcePath);
+  } catch (Failure& failure) {
+    failure.snapshotDestinationUnallocated = true;
+    throw;
+  }
+  require(maximum >= 0 && maximum <= 9007199254740991.0 && maximum == static_cast<ULONGLONG>(maximum),
+          "Invalid snapshot admission byte bound", sourcePath, ERROR_INVALID_PARAMETER);
+  LARGE_INTEGER sourceBytes{};
+  require(GetFileSizeEx(work->source->get(), &sourceBytes), "Read admitted snapshot source size failed", sourcePath);
+  require(sourceBytes.QuadPart >= 0 && static_cast<double>(sourceBytes.QuadPart) <= maximum,
+          "Snapshot source exceeds its admission byte bound", sourcePath, ERROR_FILE_TOO_LARGE);
   work->path = relativePath(root, relative);
   // Retain the write lease with read-only sharing, but omit DELETE authority:
   // Java's RandomAccessFile reader shares read/write, not delete access.
@@ -696,9 +870,9 @@ napi_value filesystemCall(napi_env env, const std::wstring& operation,
                           const std::vector<napi_value>& args, RuntimeContext& context) {
   if (operation == L"cutter_bridge_verify_directory") return verifyCutterBridgeDirectory(env, args);
   if (operation == L"cutter_bridge_read_descriptor") return readCutterBridgeDescriptor(env, args);
-  const auto expected = operation == L"open" || operation == L"close" || operation == L"runtime_close" || operation == L"runtime_snapshot_cancel" ? 1
+  const auto expected = operation == L"open" || operation == L"close" || operation == L"runtime_close" || operation == L"runtime_snapshot_cancel" || operation == L"runtime_prepare_appcontainer" ? 1
                       : operation == L"runtime_create" || operation == L"runtime_mkdir" || operation == L"runtime_open" ? 2 : 3;
-  require(args.size() == static_cast<size_t>(expected), "Wrong native filesystem argument count", L"", ERROR_INVALID_PARAMETER);
+  require(args.size() == static_cast<size_t>(expected) || (operation == L"runtime_snapshot" && args.size() == 4), "Wrong native filesystem argument count", L"", ERROR_INVALID_PARAMETER);
   if (operation == L"open") {
     auto file = openFile(wide(env, args[0]));
     auto result = identity(env, file->get(), file->requestedPath);
@@ -750,27 +924,12 @@ napi_value filesystemCall(napi_env env, const std::wstring& operation,
   // Reject overlapping operations before snapshot() resets cancellation. The
   // one accepted worker and WindowsPrivateRuntime retain the same root lease.
   if (operation == L"runtime_close") { closeRuntime(root); return null(env); }
+  if (operation == L"runtime_prepare_appcontainer") return prepareSandbox(env, root);
+  require(!root.sandbox, "Sealed AppContainer runtime forbids further private mutations", root.path, ERROR_ACCESS_DENIED);
   if (operation == L"runtime_mkdir") { directory(root, wide(env, args[1])); return null(env); }
   if (operation == L"runtime_open") {
     const auto path = relativePath(root, wide(env, args[1]));
-    auto file = runtimeDirectory(root, path.substr(0, path.find_last_of(L'\\')));
-    file->path = path;
-    file->requestedPath = path;
-    // Retained output handles have write and DELETE access, so this read open
-    // must share both to pass Windows' symmetric share check. Those retained
-    // handles still omit FILE_SHARE_WRITE and FILE_SHARE_DELETE, blocking
-    // competing writes and delete opens.
-    auto child = openRelative(file->get(), path.substr(path.find_last_of(L'\\') + 1),
-                              GENERIC_READ | FILE_READ_ATTRIBUTES | READ_CONTROL,
-                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                              FILE_NON_DIRECTORY_FILE, path);
-    FILE_ATTRIBUTE_TAG_INFO info{};
-    require(GetFileInformationByHandleEx(child.get(), FileAttributeTagInfo, &info, sizeof(info)),
-            "Read private file tag failed", path);
-    require((info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0,
-            "Reparse private file is unsupported", path, ERROR_NOT_SUPPORTED);
-    file->handles.push_back(std::move(child));
-    verifyPrivate(file->get(), path, false);
+    auto file = openRuntimeFile(root, path);
     auto result = identity(env, file->get(), path);
     set(env, result, "handle", wrap(env, std::move(file)));
     return result;
@@ -787,7 +946,8 @@ napi_value filesystemCall(napi_env env, const std::wstring& operation,
     return null(env);
   }
   if (operation == L"runtime_snapshot") {
-    return snapshot(env, args[0], root, wide(env, args[1]), wide(env, args[2]));
+    return snapshot(env, args[0], root, wide(env, args[1]), wide(env, args[2]),
+                    args.size() == 4 ? numeric(env, args[3]) : 9007199254740991.0);
   }
   throw Failure("Unknown native filesystem operation", L"", ERROR_INVALID_PARAMETER);
 }

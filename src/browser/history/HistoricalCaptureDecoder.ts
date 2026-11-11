@@ -269,7 +269,7 @@ export class HistoricalCaptureDecoder {
           "This is retained producer evidence, without live browser transaction IDs, scenario provenance, execution attribution or deployment authenticity. Recorded URLs are never fetched.",
           "Every record is decoded before selection; no partial success is returned on malformed input or a resource limit.",
           "Known authentication headers/cookies and explicitly marked literal values are excluded. Unknown extension names do not establish sensitivity.",
-          `A 32 MiB input, 96 MiB reply and 64-level nesting budget bound complete evidence. ${nodeMemoryLimitation()}; mitmproxy decoding uses a 768 MiB Linux address-space limit. Each owned command has a 30-second deadline with independent cleanup.`,
+          `A 32 MiB input, 96 MiB reply and 64-level nesting budget bound complete evidence. ${nodeMemoryLimitation()}. Each owned command has a 30-second deadline with independent cleanup.`,
         ],
       };
       if (input.format === "qlog") {

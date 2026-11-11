@@ -78,7 +78,7 @@ literal. Invalid addresses, bracketed IPv4, ports and zone identifiers remain
 validation failures. Producer declarations do not authenticate origin.
 
 Native mitmproxy decoding requires a caller-supplied **mitmdump 12.2.3 on
-Linux**. Set its absolute executable path:
+Windows or Linux**. Set its absolute executable path:
 
 ```sh
 REA_MITMDUMP_COMMAND=/absolute/mitmdump rea inspect-web-network-capture /absolute/session.mitm mitmproxy --json
@@ -91,8 +91,9 @@ HAR. Raw IDs, state versions, flow types, backup states and unknown extensions
 are preserved without synthesizing connections, timestamps or content. The
 tested upstream source is tag `v12.2.3`, commit
 `6c09d56e4c29a92f5ad01b03199977584b8ea14f`; other native tool versions return
-an explicit unsupported-profile diagnostic. Non-Linux native decoding is not
-supported by this adapter.
+an explicit unsupported-profile diagnostic. Windows uses the native mitmdump executable without WSL. Configure
+`REA_MITMDUMP_COMMAND` with its absolute path (or set it in the desktop
+`providers.json` file).
 
 ## Reading Fiddler captures (`.saz`)
 
@@ -323,7 +324,11 @@ Oversized selected captures return an input error identifying `capture_path`
 and the byte budget; owned reply/output failures remain output or provider errors.
 HAR, SAZ and qlog run in an owned
 192 MiB Node old-generation heap with one V8 worker. Mitmproxy decoding applies
-Linux limits of 768 MiB address space, 30 seconds CPU and 96 MiB file output;
+Linux limits of 768 MiB address space, 30 seconds CPU and 96 MiB file output.
+On Windows, an owned Job Object enforces 768 MiB committed memory for the
+complete decoder process tree before execution; no Linux CPU-time or per-file
+limit or filesystem/network sandbox is claimed. The 32 MiB input and 96 MiB
+reply checks apply on both hosts;
 both commands have a 30-second wall deadline and independently supervised
 process cleanup. Owned decoder diagnostics retain at most 1 MiB across stdout
 and stderr; the collector drops overflow as it arrives, reports the limit

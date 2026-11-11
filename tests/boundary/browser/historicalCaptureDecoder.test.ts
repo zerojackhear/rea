@@ -26,22 +26,25 @@ import { OwnedFileHandle } from "../../../src/filesystem/OwnedFileHandle.js";
 
 const linux = it.skipIf(process.platform !== "linux");
 
-linux("refuses a directory configured as the mitmdump executable", async () => {
-  const root = await mkdtemp(join(tmpdir(), "rea-mitmdump-command-"));
-  onTestFinished(() => rm(root, { recursive: true, force: true }));
-  const command = join(root, "mitmdump");
-  await mkdir(command);
+it.skipIf(process.platform !== "linux" && process.platform !== "win32")(
+  "refuses a directory configured as the mitmdump executable",
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), "rea-mitmdump-command-"));
+    onTestFinished(() => rm(root, { recursive: true, force: true }));
+    const command = join(root, "mitmdump");
+    await mkdir(command);
 
-  await expect(
-    new MitmproxyCaptureAdapter({ REA_MITMDUMP_COMMAND: command }).command(
-      join(root, "request.json"),
-      join(root, "runtime"),
-    ),
-  ).rejects.toMatchObject({
-    _tag: "AnalysisCapabilityUnavailableError",
-    reason: expect.stringContaining(command),
-  });
-});
+    await expect(
+      new MitmproxyCaptureAdapter({ REA_MITMDUMP_COMMAND: command }).command(
+        join(root, "request.json"),
+        join(root, "runtime"),
+      ),
+    ).rejects.toMatchObject({
+      _tag: "AnalysisCapabilityUnavailableError",
+      reason: expect.stringContaining(command),
+    });
+  },
+);
 
 linux("allows a symlink to a regular mitmdump executable", async () => {
   const root = await mkdtemp(join(tmpdir(), "rea-mitmdump-command-symlink-"));
@@ -58,6 +61,21 @@ linux("allows a symlink to a regular mitmdump executable", async () => {
     ),
   ).resolves.toMatchObject({ command });
 });
+
+it.skipIf(process.platform !== "win32")(
+  "bounds the native Windows mitmproxy process before execution",
+  async () => {
+    const profile = await new MitmproxyCaptureAdapter({
+      REA_MITMDUMP_COMMAND: process.execPath,
+    }).command("C:\\owned\\request.json", "C:\\owned\\runtime");
+    expect(profile).toMatchObject({
+      command: process.execPath,
+      memoryLimitBytes: 768 * 1024 * 1024,
+    });
+    expect(profile.arguments).toContain("--no-server");
+    expect(profile.arguments).toContain("confdir=C:\\owned\\runtime");
+  },
+);
 
 it.each([true, false])(
   "binds decoder replies to the complete selected provider identity (matching name: %s)",

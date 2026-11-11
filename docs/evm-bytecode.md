@@ -17,14 +17,16 @@ rea inspect-evm-interface ./runtime.bin raw --json
 }
 ```
 
-Initial real verification covers flat legacy bytecode on Linux x64 and unchanged
+Real verification covers flat legacy bytecode on Linux x64 and Windows x64 with unchanged
 bundled EVMole 0.9.3. EOF-style EF00 containers return `unsupported_target`,
 with the selected path and format reason. Provider/configuration failures retain
 their distinct unavailable-provider or capability classification.
-The host must already provide util-linux `prlimit`, normally `/usr/bin/prlimit`;
+Linux must already provide util-linux `prlimit`, normally `/usr/bin/prlimit`;
 `REA_EVM_PRLIMIT_COMMAND` can select another absolute executable. REA installs
 no system tools and changes no user configuration. [Upstream provenance and
 license](https://github.com/morluto/rea/blob/main/third_party/evmole/README.md) are packaged.
+Windows uses its native owned Job Object boundary and the bundled Node/WASM
+worker. No WSL or external EVM executable is needed.
 
 ## Evidence semantics
 
@@ -105,7 +107,7 @@ CLI keeps its existing complete result.
 ## Resource and lifecycle limits
 
 Inputs are limited to 4 MiB, complete replies to 16 MiB and combined diagnostic
-output to 1 MiB. An owned worker has a 256 MiB JavaScript heap, 3 GiB virtual
+output to 1 MiB. On Linux an owned worker has a 256 MiB JavaScript heap, 3 GiB virtual
 address-space limit, 30 CPU seconds and a 30-second command deadline. Virtual
 address space differs from resident memory. The worker retains inherited tighter
 soft/hard limits, reports its configured soft limits inline and leaves hard limits
@@ -113,6 +115,11 @@ unchanged. WASM trap reservations are disabled
 so the engine can run within that virtual limit; actual memory is not equated to
 its 3 GiB allowance. Limits fail without partial success. Stable snapshots,
 private files and owned processes are cleaned independently of caller cancellation.
+On Windows, the worker keeps the 256 MiB JavaScript heap and 30-second deadline;
+an owned Job Object enforces 3 GiB committed memory across the process tree.
+Linux address-space, CPU-time and per-file limits do not apply. Bounded reply
+admission remains, and no filesystem/network sandbox is claimed. The limits
+reported with Evidence describe the actual host boundary.
 Invalid-input, unsupported, cancellation, timeout and malformed-reply failures
 retain bounded stdout/stderr under `details.captured_output`, including whether
 diagnostic output was truncated. Cleanup failures preserve the

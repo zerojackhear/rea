@@ -61,6 +61,42 @@ const waitFor = async (condition: () => boolean): Promise<void> => {
 
 const snapshots: ProcessCaptureFinalization[] = [];
 
+it("reports a native forced-termination failure through the capture failure channel", async () => {
+  const fake = fakeTerminal();
+  const broken = {
+    ...fake,
+    terminal: {
+      ...fake.terminal,
+      kill: () => {
+        throw new Error("retained handle termination failed");
+      },
+    },
+  };
+  await expect(start(broken, { timeout_ms: 20 })).rejects.toThrow(
+    "retained handle termination failed",
+  );
+});
+
+it("reports asynchronous native terminal failures without inventing an exit", async () => {
+  const fake = fakeTerminal();
+  const broken = {
+    ...fake,
+    terminal: {
+      ...fake.terminal,
+      onFailure: (listener: (cause: Error) => void) => {
+        const timer = setTimeout(
+          () => listener(new Error("native input pipe failed")),
+          10,
+        );
+        return { dispose: () => clearTimeout(timer) };
+      },
+    },
+  };
+  await expect(start(broken, { timeout_ms: 5000 })).rejects.toThrow(
+    "native input pipe failed",
+  );
+});
+
 const observed = <Result extends { readonly unobserved?: boolean }>(
   result: Result,
 ): Exclude<Result, { readonly unobserved: true }> => {

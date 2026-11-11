@@ -1,0 +1,15 @@
+--- a/lib/io.c
++++ b/lib/io.c
+@@ -428,9 +428,9 @@
+ 	if (read < 0)
+ 		return read;
+ 	if (read < len) {
+-		erofs_info("reach EOF of device @ %llu, pading with zeroes",
+-			   offset | 0ULL);
+-		memset(buf + read, 0, len - read);
++        erofs_err("short device read at %llu: missing image bytes remain unknown",
++                  offset | 0ULL);
++        return -EIO;
+ 	}
+ 	return 0;
+ }

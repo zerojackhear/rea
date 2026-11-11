@@ -41,6 +41,8 @@ const authority = (
     readonly polls?: readonly unknown[];
     readonly appliedLimit?: (requested: unknown) => unknown;
     readonly failClose?: () => boolean;
+    readonly debuggerLeaderOnly?: true;
+    readonly activeProcesses?: () => unknown;
   } = {},
 ) => {
   const calls: { operation: string; arguments_: readonly unknown[] }[] = [];
@@ -64,16 +66,25 @@ const authority = (
       atomicJobAssignment: true,
       killOnOwnerClose: true,
       protocolStdin: true,
+      ...(options.debuggerLeaderOnly === true
+        ? { debuggerLeaderOnly: true }
+        : {}),
       ...(options.jobMemoryLimit === undefined ? {} : { jobMemoryLimit: true }),
     },
     call: (operation, arguments_) => {
       calls.push({ operation, arguments_ });
-      if (operation === "process_spawn")
+      if (
+        operation === "process_spawn" ||
+        operation === "process_debugger_spawn"
+      )
         return {
           pid: 42,
           handle: {},
           jobAssigned: true,
-          killOnOwnerClose: true,
+          killOnOwnerClose: operation === "process_spawn",
+          ...(operation === "process_debugger_spawn"
+            ? { debuggerLeaderOnly: true }
+            : {}),
           ...(arguments_.length === 6
             ? {
                 jobMemoryLimitBytes: (
@@ -83,7 +94,14 @@ const authority = (
             : {}),
         };
       if (operation === "process_poll") return polls.shift();
-      if (operation === "process_terminate") return true;
+      if (
+        operation === "process_terminate" ||
+        operation === "process_terminate_leader"
+      )
+        return true;
+      if (operation === "process_leader_alive") return 0;
+      if (operation === "process_alive") return options.activeProcesses?.();
+      if (operation === "process_stdin_close") return null;
       if (operation === "process_close") {
         if (options.failClose?.()) throw new Error("native close failed");
         return null;
@@ -141,6 +159,139 @@ describe("Windows native release retry", () => {
       await closed;
       expect(child.stdout.writableEnded).toBe(true);
       expect(child.stderr.writableEnded).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("Windows debugger-only ownership", () => {
+  const launchDebugger = (
+    native: WindowsNativeAuthority,
+    memoryLimitBytes?: number,
+  ) =>
+    new WindowsOwnedProcess("C:\\tools\\gdb.exe", [], undefined, {}, false, {
+      authority: native,
+      protocolStdin: true,
+      debuggerLeaderOnly: true,
+      ...(memoryLimitBytes === undefined ? {} : { memoryLimitBytes }),
+    });
+
+  it("refuses to substitute debugger ownership for missing controls or a memory limit", () => {
+    const old = authority();
+    const current = authority({
+      debuggerLeaderOnly: true,
+      jobMemoryLimit: true,
+    });
+    expect(() => launchDebugger(old.native)).toThrow(
+      "Debugger-only ownership requires",
+    );
+    expect(() => launchDebugger(current.native, LIMIT)).toThrow(
+      "cannot replace isolation",
+    );
+    expect(old.calls).toEqual([]);
+    expect(current.calls).toEqual([]);
+  });
+
+  it("requires a fresh empty-job observation after leader exit and rejects invalid counts", async () => {
+    vi.useFakeTimers();
+    try {
+      let count: unknown = 1;
+      const { native, calls } = authority({
+        debuggerLeaderOnly: true,
+        polls: [{ ...settledPoll }, { ...settledPoll }],
+        activeProcesses: () => count,
+      });
+      const child = launchDebugger(native);
+      child.stdout.resume();
+      child.stderr.resume();
+      expect(child.observeOwnedProcessTreeEnded()).toBe(false);
+      await vi.advanceTimersByTimeAsync(25);
+      expect(child.exitCode).toBe(3);
+      expect(child.observeOwnedProcessTreeEnded()).toBe(false);
+      count = -1;
+      expect(() => child.observeOwnedProcessTreeEnded()).toThrow();
+      count = undefined;
+      expect(() => child.observeOwnedProcessTreeEnded()).toThrow();
+      count = 0;
+      expect(child.observeOwnedProcessTreeEnded()).toBe(true);
+      const closed = once(child, "close");
+      child.confirmDebuggerDisposition();
+      await vi.advanceTimersByTimeAsync(25);
+      await closed;
+      expect(() => child.observeOwnedProcessTreeEnded()).toThrow(/released/u);
+      expect(
+        calls.some((call) => call.operation.startsWith("process_terminate")),
+      ).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("retains an exited debugger owner until its provider proves inferior disposition", async () => {
+    vi.useFakeTimers();
+    try {
+      const state = {
+        ...settledPoll,
+        stderr: Buffer.alloc(0),
+        activeProcesses: 1,
+      };
+      const { native, calls } = authority({
+        debuggerLeaderOnly: true,
+        polls: [state, state],
+      });
+      const child = launchDebugger(native);
+      child.stdout.resume();
+      child.stderr.resume();
+      expect(() => child.kill("SIGKILL")).toThrow(
+        "verified inferior disposition",
+      );
+      await expect(child.cleanup()).resolves.toMatchObject({ cleaned: false });
+      await vi.advanceTimersByTimeAsync(25);
+      expect(child.exitCode).toBe(3);
+      expect(child.kill(0)).toBe(false);
+      expect(calls.some((call) => call.operation === "process_close")).toBe(
+        false,
+      );
+      const closed = once(child, "close");
+      child.confirmDebuggerDisposition();
+      await vi.advanceTimersByTimeAsync(25);
+      await closed;
+      expect(
+        calls.filter((call) => call.operation === "process_close"),
+      ).toHaveLength(1);
+      expect(
+        calls.some((call) => call.operation.startsWith("process_terminate")),
+      ).toBe(false);
+      expect(child.debuggerLeaderOnly).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("terminates only the retained debugger after proof while its inferior remains alive", async () => {
+    vi.useFakeTimers();
+    try {
+      const { native, calls } = authority({
+        debuggerLeaderOnly: true,
+        polls: [
+          { ...settledPoll, stderr: Buffer.alloc(0), activeProcesses: 1 },
+        ],
+      });
+      const child = launchDebugger(native);
+      child.stdout.resume();
+      child.stderr.resume();
+      child.confirmDebuggerDisposition();
+      const cleanup = child.cleanup();
+      await vi.advanceTimersByTimeAsync(25);
+      expect(await cleanup).toEqual({ cleaned: true, signaled: true });
+      expect(
+        calls.filter((call) => call.operation === "process_terminate_leader"),
+      ).toHaveLength(1);
+      expect(calls.some((call) => call.operation === "process_terminate")).toBe(
+        false,
+      );
+      expect(calls[0]?.arguments_).toHaveLength(4);
     } finally {
       vi.useRealTimers();
     }

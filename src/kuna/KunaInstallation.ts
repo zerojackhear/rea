@@ -57,8 +57,8 @@ export interface KunaReadinessFailure {
 
 /**
  * Environment for every Kuna child. Kuna unpacks its built-in SLEIGH tree into
- * the per-user cache under HOME (macOS) or XDG_CACHE_HOME (Linux), so both
- * point inside REA's own cache root instead of the user's.
+ * the per-user HOME/XDG cache or Windows LOCALAPPDATA. All provider cache
+ * and temporary fallbacks stay inside REA's selected cache root.
  */
 export const kunaChildEnvironment = (
   configuration: KunaConfiguration,
@@ -68,6 +68,14 @@ export const kunaChildEnvironment = (
     HOME: home,
     XDG_CACHE_HOME: join(home, ".cache"),
     NO_COLOR: "1",
+    ...(process.platform === "win32"
+      ? {
+          USERPROFILE: home,
+          LOCALAPPDATA: join(home, "AppData", "Local"),
+          TEMP: join(home, "tmp"),
+          TMP: join(home, "tmp"),
+        }
+      : {}),
   };
 };
 

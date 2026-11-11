@@ -5,6 +5,10 @@ const request = (method, payload) =>
 contextBridge.exposeInMainWorld(
   "rea",
   Object.freeze({
+    getMcpSettings: () => ipcRenderer.invoke("rea:mcp-settings"),
+    setMcpSettings: (enabled) =>
+      ipcRenderer.invoke("rea:save-mcp-settings", enabled),
+    getMcpConfiguration: () => ipcRenderer.invoke("rea:mcp-configuration"),
     getExample: () => ipcRenderer.invoke("rea:example"),
     getState: () => request("state"),
     listTools: () => request("tools"),
@@ -13,6 +17,7 @@ contextBridge.exposeInMainWorld(
     listHistory: () => request("history"),
     getResult: (id) => request("result", { id }),
     pickPath: (options) => ipcRenderer.invoke("rea:pick-path", options),
+    describeTarget: (path) => ipcRenderer.invoke("rea:describe-target", path),
     exportResult: (id) => ipcRenderer.invoke("rea:export-result", id),
     copyText: (text) => ipcRenderer.invoke("rea:copy-text", text),
     windowControl: (action) => ipcRenderer.invoke("rea:window", action),

@@ -71,7 +71,10 @@ export const run = async (
     logger,
     serverLogger,
     environment,
-    delivery: createToolResultDelivery(config.value.mcpMaxResponseBytes),
+    delivery: createToolResultDelivery(
+      config.value.mcpMaxResponseBytes,
+      config.value.mcpReviewAfterAnalysis,
+    ),
     loadOptionalProviders:
       dependencies.loadOptionalProviders ??
       (() =>

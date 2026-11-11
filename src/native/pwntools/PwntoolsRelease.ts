@@ -1,4 +1,4 @@
-/** Verified unchanged upstream profile for the Linux ELF adapter. */
+/** Verified upstream parsing profile for native Windows/Linux offline ELF analysis. */
 export const PWNTOOLS_PROVIDER_IDENTITY = {
   id: "pwntools-elf",
   name: "REA pwntools ELF adapter",

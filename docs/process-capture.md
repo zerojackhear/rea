@@ -14,21 +14,30 @@ recorded, so its influence may remain unknown.
 
 ## Host support
 
-Capturing a new scenario currently requires Linux or macOS and a working
-native PTY backend. Native Windows capture is unavailable because the PTY
-adapter does not yet verify descendant cleanup. The native Job Object controls
-used by other REA providers do not establish PTY capture support. Reinstalling
-the Windows PTY binary does not enable this workflow.
+Windows x64 uses the matching bundled native addon and Windows ConPTY. Capability
+inspection launches a bounded, self-owned terminal probe; it does not infer support
+from the Windows name. A missing addon, hash mismatch, unsupported API or failed
+probe leaves capture unavailable. Linux and macOS use the native `node-pty` backend;
+reinstall its optional dependencies for the active platform and Node.js runtime
+when that backend is absent or incompatible.
 
-For Linux commands, use Linux REA inside WSL. Adapt the scenario to that host;
-this does not establish capture of a native Windows process tree. Comparing
-existing capture Evidence through the CLI or MCP remains available on Windows
-and does not launch a PTY or the captured target.
+The Windows backend records `manifest.pty_backend: "windows-conpty"`. It atomically
+places the root in a private Job Object without breakaway, samples handle-bound
+member identities, and retains that job until all descendants and terminal output
+settle. A root exit alone is not proof of cleanup. UTF-8 input/output and resizing
+are native; ConPTY combines stdout and stderr. Process sample `command` values are
+image paths, not command lines, and POSIX process-group/session IDs remain null.
 
-On supported capture hosts, a missing or incompatible native PTY binary has a
-different recovery: reinstall REA for the active platform, architecture, and
-Node.js version with optional dependencies enabled. Capability diagnostics
-distinguish this from the Windows capture-adapter limitation.
+Windows dimensions must fit signed `COORD` fields (1–32767). Pending input is bounded
+to 1 MiB and native write chunks to 64 KiB. Each native process sample is bounded to
+16384 identifiers and 8 MiB of image text; omitted or unreadable observations make
+sampling partial. `SIGKILL` requests force-terminate the retained root handle;
+scripted POSIX signals are rejected before launch. A finalization interval records
+`SIGTERM` as unverified, then escalates through the retained handle. No POSIX signal
+delivery is claimed. Cleanup terminates the owned job, including surviving descendants.
+
+Comparing existing capture Evidence through CLI or MCP does not launch a target.
+Native Windows verification does not establish Linux-binary execution on Windows.
 
 macOS also requires Apple's Swift compiler through `xcrun` for process
 ownership inspection. REA compiles its packaged, narrow process-inspection

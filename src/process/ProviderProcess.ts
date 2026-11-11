@@ -35,11 +35,15 @@ export interface OwnedProviderProcessSpawnOptions {
   readonly hostEnvironment?: NodeJS.ProcessEnv;
   /** Opt into a writable protocol stream; other providers retain ignored stdin. */
   readonly stdin?: "pipe";
+  /** Debugger-specific Windows ownership; inferiors must survive verified detach. */
+  readonly windowsDebuggerLeaderOnly?: true;
   /**
    * Commit limit in bytes for the whole owned process tree, enforced by its
    * Windows Job Object. Other launchers cannot enforce it and refuse it.
    */
   readonly memoryLimitBytes?: number;
+  /** Opaque sealed native runtime; requires the Windows owned launcher. */
+  readonly appContainerRuntime?: object;
   /** Sweep exact run-token descendants during POSIX cleanup. */
   readonly sweepTokenOwnedProcesses?: boolean;
   /** Cancels native ownership preparation before provider process creation. */
@@ -213,6 +217,12 @@ export const spawnOwnedProviderProcess = async (
       options.windowsVerbatimArguments ?? false,
       {
         protocolStdin: options.stdin === "pipe",
+        ...(options.windowsDebuggerLeaderOnly === true
+          ? { debuggerLeaderOnly: true }
+          : {}),
+        ...(options.appContainerRuntime === undefined
+          ? {}
+          : { appContainerRuntime: options.appContainerRuntime }),
         ...(options.memoryLimitBytes === undefined
           ? {}
           : { memoryLimitBytes: options.memoryLimitBytes }),
@@ -229,6 +239,14 @@ export const spawnOwnedProviderProcess = async (
       cleanup: () => child.cleanup(),
     };
   }
+  if (options.windowsDebuggerLeaderOnly === true)
+    throw new Error(
+      "Debugger-only Windows ownership requires the native Windows launcher",
+    );
+  if (options.appContainerRuntime !== undefined)
+    throw new Error(
+      "AppContainer isolation requires the native Windows launcher",
+    );
   if (options.memoryLimitBytes !== undefined)
     throw new Error(
       "Owned process memory limits require the Windows Job Object launcher; no limit can be enforced on this host.",

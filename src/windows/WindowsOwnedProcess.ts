@@ -16,6 +16,10 @@ const launchSchema = z.strictObject({
   jobAssigned: z.literal(true),
   killOnOwnerClose: z.literal(true),
 });
+const debuggerLaunchSchema = launchSchema.extend({
+  killOnOwnerClose: z.literal(false),
+  debuggerLeaderOnly: z.literal(true),
+});
 const pollSchema = z.strictObject({
   stdout: z.instanceof(Buffer),
   stderr: z.instanceof(Buffer),
@@ -37,10 +41,14 @@ const limitedPollSchema = pollSchema.extend({
 
 /** Optional native job controls for one owned Windows process tree. */
 export interface WindowsOwnedProcessOptions {
+  /** Own only the debugger, never the lifetime of its inferior processes. */
+  readonly debuggerLeaderOnly?: boolean;
   /** Open a writable protocol pipe; otherwise stdin is NUL. */
   readonly protocolStdin?: boolean;
   /** Job Object commit limit for the whole process tree, in bytes. */
   readonly memoryLimitBytes?: number;
+  /** Opaque handle of a sealed native runtime, never a caller-selected SID. */
+  readonly appContainerRuntime?: object;
   /** Verified native authority; defaults to the package-owned artifact. */
   readonly authority?: WindowsNativeAuthority;
 }
@@ -67,6 +75,7 @@ export class WindowsOwnedProcess extends EventEmitter {
   #closed = false;
   #failure: string | undefined;
   #timer: NodeJS.Timeout | undefined;
+  #drain: NodeJS.Immediate | undefined;
   #blockedWake: NodeJS.Timeout | undefined;
   readonly #blockedOutput = new Set<PassThrough>();
   #unreferenced = false;
@@ -75,6 +84,8 @@ export class WindowsOwnedProcess extends EventEmitter {
   #memoryLimitReached = false;
   #peakJobMemoryBytes: number | undefined;
   #outputIncomplete = false;
+  readonly debuggerLeaderOnly: boolean;
+  #debuggerDispositionConfirmed = false;
 
   constructor(
     command: string,
@@ -86,8 +97,19 @@ export class WindowsOwnedProcess extends EventEmitter {
   ) {
     super();
     const protocolStdin = options.protocolStdin === true;
+    this.debuggerLeaderOnly = options.debuggerLeaderOnly === true;
     this.#memoryLimitBytes = options.memoryLimitBytes;
     this.#authority = options.authority ?? requireWindowsNativeAuthority();
+    if (
+      this.debuggerLeaderOnly &&
+      (this.#authority.inspection.debuggerLeaderOnly !== true ||
+        !protocolStdin ||
+        options.appContainerRuntime !== undefined ||
+        this.#memoryLimitBytes !== undefined)
+    )
+      throw new Error(
+        "Debugger-only ownership requires a matching native artifact and protocol stdin; it cannot replace isolation or memory controls",
+      );
     if (protocolStdin && this.#authority.inspection.protocolStdin !== true)
       throw new Error(
         "The bundled Windows native artifact does not support owned protocol stdin; use a matching current Windows x64 REA package.",
@@ -100,6 +122,14 @@ export class WindowsOwnedProcess extends EventEmitter {
     )
       throw new Error(
         "The bundled Windows native artifact does not support Job Object memory limits; use a matching current Windows x64 REA package.",
+      );
+    if (
+      options.appContainerRuntime !== undefined &&
+      (this.#authority.inspection.appContainer !== true ||
+        this.#memoryLimitBytes === undefined)
+    )
+      throw new Error(
+        "AppContainer launch requires a matching native artifact and an explicit job memory limit",
       );
     const entries = Object.entries(environment)
       .filter((entry): entry is [string, string] => entry[1] !== undefined)
@@ -117,17 +147,27 @@ export class WindowsOwnedProcess extends EventEmitter {
     let controls: unknown[] = protocolStdin ? [true] : [];
     if (this.#memoryLimitBytes !== undefined)
       controls = [protocolStdin, this.#memoryLimitBytes];
-    const spawned = this.#authority.call("process_spawn", [
-      command,
-      line,
-      cwd ?? "",
-      entries,
-      ...controls,
-    ]);
+    if (options.appContainerRuntime !== undefined)
+      controls.push(options.appContainerRuntime);
+    const spawned = this.#authority.call(
+      this.debuggerLeaderOnly ? "process_debugger_spawn" : "process_spawn",
+      [
+        command,
+        line,
+        cwd ?? "",
+        entries,
+        ...(this.debuggerLeaderOnly ? [] : controls),
+      ],
+    );
+    const schema = this.debuggerLeaderOnly
+      ? debuggerLaunchSchema
+      : options.appContainerRuntime === undefined
+        ? launchSchema
+        : launchSchema.extend({ appContainer: z.literal(true) });
     const launched =
       this.#memoryLimitBytes === undefined
-        ? launchSchema.parse(spawned)
-        : launchSchema
+        ? schema.parse(spawned)
+        : schema
             .extend({ jobMemoryLimitBytes: z.literal(this.#memoryLimitBytes) })
             .parse(spawned);
     this.pid = launched.pid;
@@ -206,20 +246,60 @@ export class WindowsOwnedProcess extends EventEmitter {
       );
   }
 
-  /** Terminate the retained job, never a PID supplied by another caller. */
+  /** Confirm the provider's verified detach/no-inferior disposition before release. */
+  confirmDebuggerDisposition(): void {
+    if (!this.debuggerLeaderOnly)
+      throw new Error("This owner has whole-job lifetime authority");
+    this.#debuggerDispositionConfirmed = true;
+    this.#schedule(0);
+  }
+
+  /** Observe the retained job, not just the exited leader; never signal a member. */
+  observeOwnedProcessTreeEnded(): boolean {
+    if (this.#closed)
+      throw new Error("The owned Windows Job Object has been released");
+    if (this.exitCode === null) return false;
+    return (
+      z
+        .number()
+        .int()
+        .nonnegative()
+        .parse(this.#authority.call("process_alive", [this.#handle])) === 0
+    );
+  }
+
+  /** Terminate only the lifetime authority retained by this owner, never a supplied PID. */
   kill(signal?: NodeJS.Signals | number): boolean {
     if (signal === 0)
       return (
         !this.#closed &&
         z
           .number()
-          .parse(this.#authority.call("process_alive", [this.#handle])) > 0
+          .parse(
+            this.#authority.call(
+              this.debuggerLeaderOnly
+                ? "process_leader_alive"
+                : "process_alive",
+              [this.#handle],
+            ),
+          ) > 0
+      );
+    if (this.debuggerLeaderOnly && !this.#debuggerDispositionConfirmed)
+      throw new Error(
+        "Debugger termination requires a verified inferior disposition",
       );
     return this.#closed
       ? false
       : z
           .boolean()
-          .parse(this.#authority.call("process_terminate", [this.#handle]));
+          .parse(
+            this.#authority.call(
+              this.debuggerLeaderOnly
+                ? "process_terminate_leader"
+                : "process_terminate",
+              [this.#handle],
+            ),
+          );
   }
 
   /** Terminate and verify that the entire job has settled before releasing it. */
@@ -235,6 +315,7 @@ export class WindowsOwnedProcess extends EventEmitter {
   unref(): void {
     this.#unreferenced = true;
     this.#timer?.unref();
+    this.#drain?.unref();
     this.#blockedWake?.unref();
   }
 
@@ -242,6 +323,7 @@ export class WindowsOwnedProcess extends EventEmitter {
   ref(): void {
     this.#unreferenced = false;
     this.#timer?.ref();
+    this.#drain?.ref();
     this.#blockedWake?.ref();
   }
 
@@ -280,11 +362,22 @@ export class WindowsOwnedProcess extends EventEmitter {
     if (
       this.#closed ||
       this.#timer !== undefined ||
+      this.#drain !== undefined ||
       this.#blockedOutput.size > 0
     )
       return;
-    this.#timer = setTimeout(() => this.#poll(), delay);
-    if (this.#unreferenced) this.#timer.unref();
+    if (delay === 0) {
+      // Yield between bounded native reads without a Windows timer tick per
+      // pipe buffer. Idle children still use the 25 ms timer below.
+      this.#drain = setImmediate(() => {
+        this.#drain = undefined;
+        this.#poll();
+      });
+      if (this.#unreferenced) this.#drain.unref();
+    } else {
+      this.#timer = setTimeout(() => this.#poll(), delay);
+      if (this.#unreferenced) this.#timer.unref();
+    }
   }
 
   #scheduleBlockedWake(): void {
@@ -351,7 +444,9 @@ export class WindowsOwnedProcess extends EventEmitter {
         state.exitCode !== null &&
         state.stdoutEnded &&
         state.stderrEnded &&
-        state.activeProcesses === 0
+        (this.debuggerLeaderOnly
+          ? this.#debuggerDispositionConfirmed
+          : state.activeProcesses === 0)
       ) {
         this.#release();
       } else this.#schedule(idle ? 25 : 0);
@@ -386,6 +481,7 @@ export class WindowsOwnedProcess extends EventEmitter {
   #release(): void {
     if (this.#closed) return;
     if (this.#timer !== undefined) clearTimeout(this.#timer);
+    if (this.#drain !== undefined) clearImmediate(this.#drain);
     this.#clearBlockedWake();
     this.stdin?.destroy();
     if (!this.stdout.destroyed) this.stdout.end();

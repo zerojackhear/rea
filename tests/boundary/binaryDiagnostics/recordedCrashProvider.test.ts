@@ -32,7 +32,9 @@ const requestSchema = z.object({
   snapshot_path: z.string(),
   reply_path: z.string(),
 });
-const host = process.platform === "linux" && process.arch === "x64";
+const host =
+  (process.platform === "linux" || process.platform === "win32") &&
+  process.arch === "x64";
 
 const withCleanupGate = (
   launched: SpawnedOwnedProviderProcess,
@@ -96,7 +98,10 @@ it
     if (scenario.startsWith("wrong-e")) await writeFile(path, bytes);
     let owned = "";
     const provider = new PwntoolsRecordedCrashProvider(
-      { REA_PWNTOOLS_PYTHON: process.execPath },
+      {
+        REA_PWNTOOLS_PYTHON: process.execPath,
+        SystemRoot: process.env.SystemRoot,
+      },
       async (spawn) => {
         owned = spawn.cwd ?? "";
         const request = requestSchema.parse(
@@ -150,7 +155,7 @@ it
 );
 
 it
-  .runIf(host)
+  .runIf(host && process.platform === "linux")
   .each([
     "unconfigured",
     "success",

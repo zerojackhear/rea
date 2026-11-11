@@ -4,7 +4,15 @@ import {
   processCaptureProbeFailureReason,
   processCaptureOwnershipUnavailableReason,
   probeProcessCaptureCapability,
+  windowsProcessScenarioUnavailableReason,
 } from "../../../src/process/capture/ProcessCaptureCapability.js";
+import { processScenarioSchema } from "../../../src/domain/process/processScenario.js";
+
+const missingNative = () => ({
+  available: false as const,
+  failureStage: "artifact" as const,
+  reason: "verified artifact missing",
+});
 
 describe("process capture capability diagnostics", () => {
   it("distinguishes missing native modules from runtime ABI mismatches", () => {
@@ -78,15 +86,16 @@ describe("process capture capability diagnostics", () => {
   });
 
   it("keeps the ownership limitation separate from native PTY support", () => {
-    expect(processCaptureOwnershipUnavailableReason("win32")).toContain(
-      "Windows PTY process capture",
-    );
+    expect(
+      processCaptureOwnershipUnavailableReason("win32", missingNative),
+    ).toContain("verified artifact missing");
   });
 
   it("explains Windows capture admission before loading or spawning a PTY", async () => {
     let loaded = false;
     const capability = await probeProcessCaptureCapability({
       platform: "win32",
+      loadWindowsAuthority: missingNative,
       loadPty: async () => {
         loaded = true;
         throw new Error("Windows admission must precede PTY loading");
@@ -95,13 +104,47 @@ describe("process capture capability diagnostics", () => {
     expect(loaded).toBe(false);
     expect(capability).toMatchObject({
       available: false,
-      reason: expect.stringContaining("does not yet verify descendant cleanup"),
+      backend: "windows-conpty",
+      reason: expect.stringContaining("verified artifact missing"),
     });
     if (capability.available)
       throw new Error("expected Windows capture refusal");
-    expect(capability.reason).toContain("WSL for Linux commands");
-    expect(capability.reason).toContain(
-      "Reinstalling the PTY backend does not enable native Windows capture",
-    );
+    expect(capability.reason).toContain("Windows owned ConPTY capture");
+  });
+  it("rejects unsupported Windows controls before target launch", () => {
+    expect(
+      windowsProcessScenarioUnavailableReason(
+        processScenarioSchema.parse({
+          executable: "self.exe",
+          events: [{ type: "signal", at_ms: 1, signal: "SIGTERM" }],
+        }),
+      ),
+    ).toContain("POSIX signals");
+    expect(
+      windowsProcessScenarioUnavailableReason(
+        processScenarioSchema.parse({
+          executable: "self.exe",
+          terminal: { columns: 32768, rows: 1, scrollback: 0 },
+        }),
+      ),
+    ).toContain("COORD");
+    expect(
+      windowsProcessScenarioUnavailableReason(
+        processScenarioSchema.parse({
+          executable: "self.exe",
+          events: [
+            { type: "input", at_ms: 1, data: "a".repeat(1024 * 1024 + 1) },
+          ],
+        }),
+      ),
+    ).toContain("1 MiB");
+    expect(
+      windowsProcessScenarioUnavailableReason(
+        processScenarioSchema.parse({
+          executable: "self.exe",
+          events: [{ type: "signal", at_ms: 1, signal: "SIGKILL" }],
+        }),
+      ),
+    ).toBeUndefined();
   });
 });

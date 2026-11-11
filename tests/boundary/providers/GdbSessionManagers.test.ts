@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { GdbSessionManager } from "../../../src/gdb/GdbSessionManager.js";
+import { spawnNodeGdbFixture } from "./gdbTestHelpers.js";
 
 describe("persistent debugger session managers", () => {
   let directory: string | undefined;
@@ -49,6 +50,7 @@ process.stdin.on("data", (chunk) => {
     const manager = new GdbSessionManager({
       platform: "linux",
       environment: { REA_GDB_COMMAND: provider },
+      spawnProcess: spawnNodeGdbFixture,
     });
     managers.push(manager);
 
@@ -95,6 +97,7 @@ process.stdin.on("data", (chunk) => {
     const manager = new GdbSessionManager({
       platform: "linux",
       environment: { REA_GDB_COMMAND: provider },
+      spawnProcess: spawnNodeGdbFixture,
     });
     managers.push(manager);
 

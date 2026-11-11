@@ -14,6 +14,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -38,6 +39,8 @@ struct Failure : std::runtime_error {
   std::wstring cleanupPath;
   // Affirmative proof for a failed runtime-parent admission; omission is unknown.
   bool runtimeDirectoryUnallocated = false;
+  // Source admission failed before any destination was created.
+  bool snapshotDestinationUnallocated = false;
   Failure(std::string constraint, std::wstring path = L"", DWORD code = GetLastError())
       : std::runtime_error(constraint), win32(code), path(std::move(path)),
         constraint(std::move(constraint)) {}
@@ -86,7 +89,20 @@ struct File : Resource {
   explicit File(std::wstring path) : Resource(Kind::File), requestedPath(path), path(std::move(path)) {}
   HANDLE get() const { return handles.back().get(); }
 };
+struct Sandbox {
+  std::wstring name, profilePath;
+  std::vector<unsigned char> sid;
+  std::vector<Handle> jobs;
+  std::vector<Handle> directoryLeases;
+  bool deletionConfirmed = false;
+  bool created = false, ready = false;
+  ~Sandbox();
+  void create();
+  void verifyStopped();
+  void close();
+};
 struct Runtime : Resource {
+  std::shared_ptr<Sandbox> sandbox;
   std::wstring path;
   std::vector<Handle> parents;
   Handle directory;
@@ -109,8 +125,17 @@ struct Process : Resource {
   ULONGLONG memoryLimit = 0;
   bool memoryLimitReached = false;
   bool inputPending = false;
+  bool debuggerLeaderOnly = false;
+  bool launchReady = false;
+  HPCON console = nullptr;
+  bool hasTerminal = false;
+  bool consoleClosing = false;
+  std::atomic_bool consoleCloseFinished{false};
+  std::thread consoleCloser;
   DWORD pid = 0;
+  std::shared_ptr<Sandbox> sandbox;
   Process() : Resource(Kind::Process) {}
+  ~Process() override;
 };
 
 void check(napi_status status);
@@ -141,9 +166,15 @@ napi_value filesystemCall(napi_env env, const std::wstring& operation,
                           const std::vector<napi_value>& args, RuntimeContext& context);
 std::unique_ptr<Process> spawnProcess(const std::wstring& command, const std::wstring& commandLine,
                                     const std::wstring& cwd, const std::vector<std::wstring>& environment,
-                                    bool protocolStdin = false, ULONGLONG memoryLimit = 0);
+                                    bool protocolStdin = false, ULONGLONG memoryLimit = 0, std::shared_ptr<Sandbox> sandbox = nullptr,
+                                    const COORD* terminalSize = nullptr, bool debuggerLeaderOnly = false);
+void admitSandboxLaunch(Runtime&, const std::wstring&, const std::wstring&);
+void verifySandboxProcess(HANDLE, Sandbox&);
+std::vector<std::wstring> sandboxEnvironment(const std::wstring& command, const std::wstring& cwd);
 napi_value processCall(napi_env env, const std::wstring& operation,
                        const std::vector<napi_value>& args);
 napi_value inspect(napi_env env, std::unique_ptr<Runtime>& pending);
+napi_value debuggerCall(napi_env env, const std::wstring& operation,
+                        const std::vector<napi_value>& args);
 
 } // namespace rea

@@ -457,6 +457,15 @@ export const startProcessSampler = (options: {
   readonly limit: number;
   readonly samples: ProcessSample[];
   readonly recordEvent?: RecordProcessCaptureEvent;
+  /** A native owner can enumerate its job directly without a POSIX run token. */
+  readonly sampleOwnedProcesses?: (
+    elapsedMs: number,
+    limit: number,
+  ) => {
+    readonly values: readonly ProcessSample[];
+    readonly limited: boolean;
+    readonly incompleteReason?: string;
+  };
 }): (() => Promise<{
   readonly partial: boolean;
   readonly coverage: ProcessSamplingCoverage;
@@ -479,6 +488,22 @@ export const startProcessSampler = (options: {
     const controller = new AbortController();
     abortCurrent = () => controller.abort();
     pending = (async () => {
+      if (options.sampleOwnedProcesses !== undefined) {
+        const observed = options.sampleOwnedProcesses(
+          monotonicProcessCaptureClock() - started,
+          Math.min(Number.MAX_SAFE_INTEGER, limit + 1),
+        );
+        if (observed.limited) {
+          partial = true;
+          limitReached = true;
+        }
+        if (observed.incompleteReason !== undefined) {
+          partial = true;
+          samplingFailures += 1;
+          firstSamplingFailure ??= observed.incompleteReason;
+        }
+        return observed.values;
+      }
       if (!rootInitialized) {
         const identity = await inspectInitializedPtyRoot(
           rootPid,

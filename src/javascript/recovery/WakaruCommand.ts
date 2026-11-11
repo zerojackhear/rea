@@ -6,6 +6,7 @@ import {
   AnalysisCancelledError,
   AnalysisCapabilityUnavailableError,
   AnalysisOutputError,
+  AnalysisResourceConstraintError,
 } from "../../domain/analysisErrorCore.js";
 import { ProviderAdapterError } from "../../domain/providerAdapterError.js";
 import { ProviderCleanupError } from "../../domain/providerCleanupError.js";
@@ -26,7 +27,7 @@ import { RECOVERY_LIMITS } from "./WakaruRelease.js";
 
 const OPERATION = "recover_javascript_sources";
 const WAKARU_REQUIREMENT =
-  "Provide an absolute REA_WAKARU_COMMAND pointing to a Wakaru ^1.13.0 Linux x64 binary (verified with 1.14.0); no tool is installed by REA. See docs/javascript-recovery.md#install-wakaru.";
+  "Provide an absolute REA_WAKARU_COMMAND pointing to a Wakaru ^1.13.0 binary for Linux x64 or Windows x64 (verified with 1.14.0); no tool is installed by REA. See docs/javascript-recovery.md#install-wakaru.";
 
 /** Inject the owned process launcher while retaining production protocol parsing. */
 export type WakaruLauncher = (
@@ -64,7 +65,7 @@ export const resolveWakaruCommand = async (
 ) => {
   const configured = environment.REA_WAKARU_COMMAND;
   if (
-    process.platform !== "linux" ||
+    (process.platform !== "linux" && process.platform !== "win32") ||
     process.arch !== "x64" ||
     configured === undefined ||
     !isAbsolute(configured)
@@ -82,6 +83,8 @@ export const resolveWakaruCommand = async (
       command,
       RECOVERY_LIMITS.outputBytes,
     );
+    if (process.platform === "win32")
+      return { command, limiter: null, ...fingerprint };
     const limiter =
       environment.REA_JAVASCRIPT_PRLIMIT_COMMAND ?? "/usr/bin/prlimit";
     if (!isAbsolute(limiter))
@@ -91,7 +94,9 @@ export const resolveWakaruCommand = async (
       throw new TypeError(`Resource limiter is not a regular file: ${limiter}`);
     return { command, limiter, ...fingerprint };
   } catch (cause: unknown) {
-    const reason = `Configured Wakaru or util-linux prlimit is unavailable: ${recoveryFailureMessage(cause)}`;
+    const resource =
+      process.platform === "win32" ? "Wakaru" : "Wakaru or util-linux prlimit";
+    const reason = `Configured ${resource} is unavailable: ${recoveryFailureMessage(cause)}`;
     throw new AnalysisCapabilityUnavailableError("wakaru", OPERATION, reason, {
       cause,
       userMessage: reason,
@@ -101,7 +106,7 @@ export const resolveWakaruCommand = async (
 
 type WakaruCommandContext = {
   command: string;
-  limiter: string;
+  limiter: string | null;
   arguments: readonly string[];
   cwd: string;
   deadline: number;
@@ -116,29 +121,42 @@ export const runWakaruCommand = async (context: WakaruCommandContext) => {
   checkRecoveryDeadline(context.deadline, context.signal);
   const runId = `rea-wakaru-${randomUUID()}`;
   const spawned = await (context.launcher ?? spawnOwnedProviderProcess)({
-    command: context.limiter,
-    arguments: [
-      `--as=${String(RECOVERY_LIMITS.addressSpaceBytes)}`,
-      `--fsize=${String(RECOVERY_LIMITS.outputBytes)}`,
-      "--core=0",
-      "--cpu=120",
-      "--",
-      context.command,
-      ...context.arguments,
-    ],
+    command: context.limiter ?? context.command,
+    ...(context.limiter === null
+      ? { memoryLimitBytes: RECOVERY_LIMITS.addressSpaceBytes }
+      : {}),
+    arguments:
+      context.limiter === null
+        ? context.arguments
+        : [
+            `--as=${String(RECOVERY_LIMITS.addressSpaceBytes)}`,
+            `--fsize=${String(RECOVERY_LIMITS.outputBytes)}`,
+            "--core=0",
+            "--cpu=120",
+            "--",
+            context.command,
+            ...context.arguments,
+          ],
     expectedCommand: null,
     runId,
     cwd: context.cwd,
     hostEnvironment: context.environment,
     ...(context.signal === undefined ? {} : { signal: context.signal }),
-    env: { TMPDIR: context.cwd, RAYON_NUM_THREADS: "1", NO_COLOR: "1" },
+    env: {
+      TMPDIR: context.cwd,
+      TMP: context.cwd,
+      TEMP: context.cwd,
+      RAYON_NUM_THREADS: "1",
+      NO_COLOR: "1",
+    },
   }).catch((cause: unknown) => {
     if (context.signal?.aborted === true)
       throw new AnalysisCancelledError(OPERATION);
     throw new ProviderAdapterError("wakaru", OPERATION, {
       cause,
       diagnostics: {
-        reason: "Failed to launch configured Wakaru through util-linux prlimit",
+        reason:
+          "Failed to launch configured Wakaru through its owned resource boundary",
         command: context.command,
         detail: recoveryFailureMessage(cause),
       },
@@ -153,6 +171,7 @@ export const runWakaruCommand = async (context: WakaruCommandContext) => {
         spawned.cleanup ?? (() => cleanupOwnedProcessGroup(spawned.ownership)),
     },
     {
+      maxDiagnosticBytes: 2 * RECOVERY_LIMITS.reportBytes,
       onDiagnostic: (event) => {
         if (
           event.type === "output" &&
@@ -195,6 +214,26 @@ export const runWakaruCommand = async (context: WakaruCommandContext) => {
       snapshot,
     );
   if (failure !== undefined) throw failure;
+  if (snapshot.memoryLimitReached === true)
+    throw new AnalysisResourceConstraintError(
+      OPERATION,
+      "memory",
+      "Wakaru reached the Windows process-tree commit limit.",
+      { job_memory_bytes: RECOVERY_LIMITS.addressSpaceBytes },
+      {
+        capturedOutput: {
+          stdout: snapshot.stdout.text,
+          stderr: snapshot.stderr.text,
+          stdout_bytes: snapshot.stdout.observedBytes,
+          stderr_bytes: snapshot.stderr.observedBytes,
+          truncated:
+            snapshot.stdout.bytes < snapshot.stdout.observedBytes ||
+            snapshot.stderr.bytes < snapshot.stderr.observedBytes,
+          exit_code: snapshot.exitCode ?? null,
+          signal: snapshot.signal ?? null,
+        },
+      },
+    );
   if (context.signal?.aborted === true)
     throw new AnalysisCancelledError(OPERATION);
   return {
@@ -204,6 +243,10 @@ export const runWakaruCommand = async (context: WakaruCommandContext) => {
     stderr: snapshot.stderr.text,
     command: context.command,
     arguments: [...context.arguments],
-    resource_limiter: context.limiter,
+    resource_limiter: context.limiter ?? {
+      kind: "windows-job-object",
+      scope: "owned-process-tree",
+      memory_limit_bytes: RECOVERY_LIMITS.addressSpaceBytes,
+    },
   };
 };

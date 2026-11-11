@@ -608,23 +608,22 @@ it.runIf(!unsupportedHost)(
     ).toMatchObject({ ok: false, error: { _tag: "AnalysisCancelledError" } });
   },
 );
-it.runIf(unsupportedHost)(
-  "reports unverified host coverage before acquiring a provider",
-  async () => {
-    const result = await new PwntoolsLayoutProvider({}).inspect({
-      path: "/selected.elf",
-    });
-    expect(result).toMatchObject({
-      ok: false,
-      error: { _tag: "AnalysisCapabilityUnavailableError" },
-    });
-    // Another target cannot satisfy a host requirement, so name it.
-    if (result.ok) throw new Error("Expected a host refusal");
-    const projected = projectAnalysisError(result.error);
-    expect(projected.message).toContain("Linux x64");
-    expect(projected.remediation.action).toContain("Linux x64");
-  },
-);
+it.runIf(
+  unsupportedHost && (process.platform !== "win32" || process.arch !== "x64"),
+)("reports unverified host coverage before acquiring a provider", async () => {
+  const result = await new PwntoolsLayoutProvider({}).inspect({
+    path: "/selected.elf",
+  });
+  expect(result).toMatchObject({
+    ok: false,
+    error: { _tag: "AnalysisCapabilityUnavailableError" },
+  });
+  // Another target cannot satisfy a host requirement, so name it.
+  if (result.ok) throw new Error("Expected a host refusal");
+  const projected = projectAnalysisError(result.error);
+  expect(projected.message).toContain("Linux x64");
+  expect(projected.remediation.action).toContain("Linux x64");
+});
 
 it.runIf(!unsupportedHost)(
   "retains decoder warnings when cancellation arrives during successful root cleanup",

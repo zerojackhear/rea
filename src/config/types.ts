@@ -7,6 +7,7 @@ import type { McpInputSchemaProfile } from "./mcpInputSchemaProfile.js";
 
 export interface AppConfig {
   readonly mcpMaxResponseBytes?: number;
+  readonly mcpReviewAfterAnalysis?: boolean;
   readonly mcpInputSchemaProfile?: McpInputSchemaProfile;
   readonly analysisProvider: AnalysisProviderSelector;
   readonly idaMcpConfigPath?: string;

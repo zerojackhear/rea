@@ -14,9 +14,12 @@ import { PrivateRuntimeRoot } from "../dist/process/PrivateRuntimeRoot.js";
 import { parseEvidence } from "../dist/domain/evidence.js";
 import { createVerifierRun, completeVerifierRun } from "./lib/verifier-run.mjs";
 
-if (process.platform !== "linux")
+if (
+  process.platform !== "linux" &&
+  !(process.platform === "win32" && process.arch === "x64")
+)
   throw new Error(
-    "Real signal verification requires Linux with util-linux prlimit.",
+    "Real signal verification requires Linux with prlimit or native Windows x64.",
   );
 if (!isAbsolute(process.env.REA_SIGROK_COMMAND ?? ""))
   throw new Error(
@@ -33,9 +36,10 @@ const pagedPath = join(root.path, "paged.vcd");
 const execute = promisify(execFile);
 const environment = {
   ...process.env,
-  TMPDIR: root.path,
-  TMP: root.path,
-  TEMP: root.path,
+  // A Windows native runtime lease cannot be another process's temp root.
+  ...(process.platform === "win32"
+    ? {}
+    : { TMPDIR: root.path, TMP: root.path, TEMP: root.path }),
 };
 const client = new Client({ name: "signal-recording-verifier", version: "1" });
 const transport = new StdioClientTransport({
@@ -70,18 +74,21 @@ lines.push(`#${tick + 1000}`, "1!");
 const source = lines.join("\n") + "\n";
 let cases = 0;
 const discoveryMeasurements = [];
-const inheritedAddressSpace = (await readFile("/proc/self/limits", "utf8"))
-  .split("\n")
-  .find((line) => line.startsWith("Max address space "))
-  ?.trim()
-  .match(/^Max address space\s+(\S+)\s+(\S+)\s+bytes$/u);
-assert.ok(inheritedAddressSpace);
-const expectedAddressSpace = Math.min(
-  1073741824,
-  ...inheritedAddressSpace
-    .slice(1)
-    .map((value) => (value === "unlimited" ? Infinity : Number(value))),
-);
+let expectedAddressSpace = null;
+if (process.platform === "linux") {
+  const inheritedAddressSpace = (await readFile("/proc/self/limits", "utf8"))
+    .split("\n")
+    .find((line) => line.startsWith("Max address space "))
+    ?.trim()
+    .match(/^Max address space\s+(\S+)\s+(\S+)\s+bytes$/u);
+  assert.ok(inheritedAddressSpace);
+  expectedAddressSpace = Math.min(
+    1073741824,
+    ...inheritedAddressSpace
+      .slice(1)
+      .map((value) => (value === "unlimited" ? Infinity : Number(value))),
+  );
+}
 
 try {
   await writeFile(path, source);
@@ -121,15 +128,26 @@ try {
     assert.equal(report.hardware_acquisition, "not-performed");
     assert.equal(report.limits.address_space_bytes, expectedAddressSpace);
     assert.equal(report.tool.configured_path, process.env.REA_SIGROK_COMMAND);
-    assert.equal(
-      report.resource_limiter.configured_path,
-      process.env.REA_SIGROK_PRLIMIT_COMMAND ?? "/usr/bin/prlimit",
-    );
-    assert.ok(
-      report.resource_limiter.arguments.includes(
-        `--as=${expectedAddressSpace}:${expectedAddressSpace}`,
-      ),
-    );
+    if (process.platform === "win32") {
+      assert.deepEqual(report.resource_limiter, {
+        kind: "windows-job-object",
+        scope: "owned-process-tree",
+        memory_limit_bytes: 1073741824,
+      });
+      assert.equal(report.limits.job_memory_bytes, 1073741824);
+      assert.equal(report.limits.cpu_seconds, null);
+      assert.equal(report.limits.file_bytes, null);
+    } else {
+      assert.equal(
+        report.resource_limiter.configured_path,
+        process.env.REA_SIGROK_PRLIMIT_COMMAND ?? "/usr/bin/prlimit",
+      );
+      assert.ok(
+        report.resource_limiter.arguments.includes(
+          `--as=${expectedAddressSpace}:${expectedAddressSpace}`,
+        ),
+      );
+    }
     assert.equal(report.diagnostics, "");
     const flags = Object.entries(input)
       .filter(([key]) => key !== "path")
@@ -282,7 +300,7 @@ try {
       ["--dont-scan", "--list-supported"],
       { env: environment, timeout: 30000, maxBuffer: 4 * 1024 * 1024 },
     )
-  ).stdout;
+  ).stdout.replaceAll("\r\n", "\n");
   const catalogHeading = "Supported protocol decoders:\n";
   assert.ok(nativeCatalogText.includes(catalogHeading));
   // Independent native-output oracle, without importing the production parser.

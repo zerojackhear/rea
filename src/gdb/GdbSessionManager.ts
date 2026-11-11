@@ -31,6 +31,14 @@ import {
   verifyOwnedInferiorsEnded,
 } from "../process/ownedDebuggerSession.js";
 import { parseLinuxProcessStartTime } from "../process/ProcessOwnershipObservation.js";
+import { resolveWindowsProviderExecutable } from "../process/resolveWindowsProviderExecutable.js";
+import {
+  inspectWindowsDebuggerOutputFile,
+  readWindowsProcessStartTime,
+  verifyWindowsInferiorOutputSink,
+  windowsDebuggerUnavailableReason,
+} from "../windows/WindowsDebuggerObservation.js";
+import { WINDOWS_GDB_PRIVATE_STDIO_COMMAND } from "./windowsGdbStartup.js";
 
 const STARTUP_TIMEOUT_MS = 10_000;
 const COMMAND_TIMEOUT_MS = 120_000;
@@ -346,15 +354,24 @@ export class GdbSessionManager {
     } = {},
   ) {
     this.#environment = { ...(options.environment ?? process.env) };
-    this.#command = this.#environment.REA_GDB_COMMAND ?? "gdb";
+    const command = this.#environment.REA_GDB_COMMAND ?? "gdb";
     this.#commandTimeoutMs = options.commandTimeoutMs ?? COMMAND_TIMEOUT_MS;
     this.#startupTimeoutMs = options.startupTimeoutMs ?? STARTUP_TIMEOUT_MS;
     this.#platform = options.platform ?? process.platform;
+    this.#command =
+      this.#platform === "win32"
+        ? resolveWindowsProviderExecutable(command, this.#environment)
+        : command;
     this.#stopProcess = options.stopProcess ?? stopOwnedDebuggerProcess;
     this.#spawnProcess = options.spawnProcess ?? spawnOwnedProviderProcess;
     this.#verifyInferiorOutputSink =
-      options.verifyInferiorOutputSink ?? verifyGdbInferiorOutputSink;
-    this.#readInferiorProcessStartTime = options.readInferiorProcessStartTime;
+      options.verifyInferiorOutputSink ??
+      (this.#platform === "win32"
+        ? verifyWindowsInferiorOutputSink
+        : verifyGdbInferiorOutputSink);
+    this.#readInferiorProcessStartTime =
+      options.readInferiorProcessStartTime ??
+      (this.#platform === "win32" ? readWindowsProcessStartTime : undefined);
     this.#maxSessions = options.maxSessions ?? DEFAULT_MAX_SESSIONS;
     this.#maxCommandOutputBytes =
       options.maxCommandOutputBytes ?? MAX_COMMAND_OUTPUT_BYTES;
@@ -385,16 +402,35 @@ export class GdbSessionManager {
       );
     if (this.#closing || signal?.aborted)
       return err(new AnalysisCancelledError("start_gdb_session"));
-    if (this.#platform !== "linux")
+    const unavailableReason =
+      this.#platform === "win32"
+        ? windowsDebuggerUnavailableReason()
+        : this.#platform === "linux"
+          ? undefined
+          : "Persistent GDB sessions require Linux /proc or the Windows native debugger controls to verify live inferior output identity.";
+    if (unavailableReason !== undefined)
       return err(
         new AnalysisCapabilityUnavailableError(
           "gdb",
           "start_gdb_session",
-          this.#platform === "win32"
-            ? "Persistent Windows GDB sessions are unavailable because owned Job Object cleanup can terminate debugger inferiors."
-            : "Persistent GDB sessions are available only on Linux because REA verifies live inferior output descriptors through /proc.",
+          unavailableReason,
         ),
       );
+    if (this.#platform === "win32" && options.inferiorTty !== undefined) {
+      try {
+        inspectWindowsDebuggerOutputFile(options.inferiorTty);
+      } catch (cause: unknown) {
+        return err(
+          new AnalysisInputError("start_gdb_session", { cause }, [
+            {
+              path: ["inferior_tty"],
+              reason: "invalid_value",
+              message: `Windows inferior output requires an existing regular file on local NTFS: ${cause instanceof Error ? cause.message : String(cause)}`,
+            },
+          ]),
+        );
+      }
+    }
     const controller = new AbortController();
     const relayAbort = (): void => controller.abort(signal?.reason);
     signal?.addEventListener("abort", relayAbort, { once: true });
@@ -495,6 +531,9 @@ export class GdbSessionManager {
         arguments: ["--nx", "--quiet", `--interpreter=${miVersion}`],
         runId: randomUUID(),
         stdin: "pipe",
+        ...(this.#platform === "win32"
+          ? { windowsDebuggerLeaderOnly: true as const }
+          : {}),
         hostEnvironment: this.#environment,
         signal,
       };
@@ -635,6 +674,25 @@ export class GdbSessionManager {
           "start_gdb_session",
           `GDB rejected the required automatic-loading disable command (${autoLoad.mi}); the session was not started.`,
         );
+      }
+      if (this.#platform === "win32") {
+        const isolated = await this.#request(
+          session,
+          `-interpreter-exec console ${miQuote(WINDOWS_GDB_PRIVATE_STDIO_COMMAND)}`,
+          signal,
+          "start_gdb_session",
+        );
+        if (
+          isolated.completion_status !== "complete" ||
+          isolated.output_truncated ||
+          !/^\d+\^done(?:,|$)/u.test(isolated.mi) ||
+          !isolated.console.includes("REA_PRIVATE_STDIO_OK")
+        )
+          throw new AnalysisCapabilityUnavailableError(
+            "gdb",
+            "start_gdb_session",
+            "Windows GDB requires Python with ctypes to verify that its private protocol pipes cannot be inherited by inferior processes.",
+          );
       }
       if (inferiorTty !== undefined) {
         const configured = await this.#request(
@@ -1148,6 +1206,34 @@ export class GdbSessionManager {
               await this.#request(session, "-gdb-exit");
             } else {
               session.noInferiorVerified = false;
+              if (
+                this.#platform === "win32" &&
+                session.protocolError === undefined &&
+                session.cleanupFailures.size === 0
+              ) {
+                // A failed read-only readiness check has not attempted detach
+                // or process cleanup. Keep the correlated session usable so
+                // the caller can repair output or let the inferior finish.
+                try {
+                  await this.#inspectInferiorForDetach(session);
+                } catch (cause) {
+                  if (
+                    !session.exited &&
+                    session.protocolError === undefined &&
+                    session.pending.size === 0
+                  )
+                    return err(
+                      new AnalysisInputError("close_gdb_session", { cause }, [
+                        {
+                          path: ["session_id"],
+                          reason: "invalid_value",
+                          message: `GDB close was not attempted: ${gdbErrorMessage(cause)} Repair the selected output or finish the inferior through this session before retrying close.`,
+                        },
+                      ]),
+                    );
+                  throw cause;
+                }
+              }
               const disposition = await this.#detachInferior(session);
               targetState =
                 disposition.status === "no-inferior"
@@ -1499,7 +1585,9 @@ export class GdbSessionManager {
     session: GdbSession,
   ): ReturnType<typeof stopOwnedDebuggerProcess> {
     if (session.stopAttempt !== undefined) return session.stopAttempt;
-    const attempt = this.#stopProcess(session, "GDB")
+    const attempt = this.#stopProcess(session, "GDB", {
+      platform: this.#platform,
+    })
       .then((stopped) => {
         if (stopped.status !== "incomplete") {
           for (const failure of session.cleanupFailures)
@@ -1531,10 +1619,10 @@ export class GdbSessionManager {
     return failure;
   }
 
-  async #detachInferior(
+  async #inspectInferiorForDetach(
     session: GdbSession,
-  ): Promise<OwnedDebuggerDetachResult> {
-    if (session.noInferiorVerified) return { status: "no-inferior" };
+  ): Promise<"no-inferior" | "ready"> {
+    if (session.noInferiorVerified) return "no-inferior";
     if (session.exited)
       throw new Error("GDB exited before inferior state could be verified.");
     // A new MI inspection replaces the old snapshot. If this read is
@@ -1563,7 +1651,7 @@ export class GdbSessionManager {
     if (inferiorPids?.length === 0) {
       session.knownInferiorIdentities.clear();
       session.noInferiorVerified = true;
-      return { status: "no-inferior" };
+      return "no-inferior";
     }
     session.noInferiorVerified = false;
     if (inferiorPids?.length !== 1)
@@ -1596,6 +1684,14 @@ export class GdbSessionManager {
           identity,
         ),
     );
+    return "ready";
+  }
+
+  async #detachInferior(
+    session: GdbSession,
+  ): Promise<OwnedDebuggerDetachResult> {
+    if ((await this.#inspectInferiorForDetach(session)) === "no-inferior")
+      return { status: "no-inferior" };
     const detached = await this.#request(session, "-target-detach");
     if (
       detached.completion_status !== "complete" ||

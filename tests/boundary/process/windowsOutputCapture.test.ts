@@ -7,7 +7,9 @@ import {
   spawnOwnedProviderProcess,
 } from "../../../src/process/ProviderProcess.js";
 
-const OUTPUT_BYTES = 8 * 1024 * 1024 + 64 * 1024;
+// A real TShark field catalog exceeds 22 MiB; a small stream hid timer-tick
+// throttling on Windows even when native reads were bounded and lossless.
+const OUTPUT_BYTES = 24 * 1024 * 1024 + 64 * 1024;
 const WRITE_BYTES = 64 * 1024;
 const WINDOWS_OUTPUT_DEADLINE_MS = 30_000;
 

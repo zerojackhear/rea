@@ -1,0 +1,3042 @@
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -20,8 +20,8 @@
+   "pydantic>=2.0",
+   "pyfatfs>=1.0.5",
+   "pymdown-extensions>=10.15",
+-  "pyperscan>=0.3.0",
+-  "python-magic>=0.4.27",
++  "hyperscan==0.9.1",
++  "python-magic-standalone==0.4.29",
+   "pyzstd>0.16.2",
+   "rarfile>=4.1",
+   "rich>=13.3.5",
+@@ -34,7 +34,7 @@
+ name = "unblob"
+ readme = "README.md"
+ requires-python = ">=3.10"
+-version = "26.6.4"
++version = "26.6.4+rea.win.prototype.1"
+ 
+ [project.scripts]
+ unblob = "unblob.cli:main"
+--- a/python/unblob/cli.py
++++ b/python/unblob/cli.py
+@@ -293,7 +293,7 @@
+     "--process-num",
+     "process_num",
+     type=click.IntRange(1),
+-    default=DEFAULT_PROCESS_NUM,
++    default=1 if sys.platform == "win32" else DEFAULT_PROCESS_NUM,
+     help="Number of worker processes to process files parallelly.",
+     show_default=True,
+ )
+@@ -402,6 +402,13 @@
+     plugin_manager: UnblobPluginManager,
+     verbose: int,
+ ) -> ProcessResult:
++    if sys.platform == "win32":
++        if no_sandbox:
++            raise click.UsageError("Windows extraction cannot disable native isolation")
++        if process_num != 1:
++            raise click.UsageError("Windows extraction requires one isolated worker")
++        from unblob.windows_sandbox import require_native_sandbox
++        require_native_sandbox()
+     configure_logger(verbose, extract_root, log_path)
+ 
+     plugin_manager.import_plugins(plugins_path)
+--- a/python/unblob/file_utils.py
++++ b/python/unblob/file_utils.py
+@@ -54,7 +54,8 @@
+         m.write(content)
+         m.seek(0)
+         m.access = mmap.ACCESS_WRITE
+-        m.madvise(mmap.MADV_SEQUENTIAL)
++        if sys.platform != "win32":
++            m.madvise(mmap.MADV_SEQUENTIAL)
+         return m
+ 
+     @classmethod
+@@ -68,7 +69,8 @@
+         with path.open(mode) as base_file:
+             m = cls(base_file.fileno(), 0, access=access)
+             m.access = access
+-            m.madvise(mmap.MADV_SEQUENTIAL)
++            if sys.platform != "win32":
++                m.madvise(mmap.MADV_SEQUENTIAL)
+             return m
+ 
+     def seek(self, pos: int, whence: int = os.SEEK_SET) -> int:  # pyright: ignore[reportIncompatibleMethodOverride]
+@@ -310,7 +312,11 @@
+ 
+ def stream_scan(scanner, file: File):
+     """Scan the whole file by increment of DEFAULT_BUFSIZE using Hyperscan's streaming mode."""
+-    scanner.scan(file, DEFAULT_BUFSIZE)
++    try:
++        scanner.scan(file, DEFAULT_BUFSIZE)
++    finally:
++        if sys.platform == "win32":
++            scanner.close()
+ 
+ 
+ class StructParser:
+@@ -489,9 +495,23 @@
+ 
+     @functools.cached_property
+     def has_root_permissions(self):
+-        return os.geteuid() == 0
++        return hasattr(os, "geteuid") and os.geteuid() == 0
++
++    def _validate_windows_path(self, path: Path):
++        if sys.platform != "win32":
++            return
++        from unblob.models import ExtractError
++        from unblob.windows_archive_paths import checked_windows_archive_path
++
++        try:
++            checked_windows_archive_path(self.root, str(path))
++        except ValueError as error:
++            problem = ExtractionProblem(path=str(path), problem=str(error), resolution="Skipped; original archive coordinates retained.")
++            self.record_problem(problem)
++            raise ExtractError(problem) from error
+ 
+     def _fs_path(self, path: Path) -> _FSPath:
++        self._validate_windows_path(path)
+         return _FSPath(root=self.root, path=path)
+ 
+     def _ensure_parent_dir(self, path: Path):
+@@ -568,6 +588,8 @@
+             self.record_problem(problem)
+ 
+     def _get_checked_link(self, src: Path, dst: Path) -> _FSLink | None:
++        self._validate_windows_path(src)
++        self._validate_windows_path(dst)
+         link = _FSLink(root=self.root, src=src, dst=dst)
+         if link.is_safe:
+             return link
+--- a/python/unblob/finder.py
++++ b/python/unblob/finder.py
+@@ -7,7 +7,7 @@
+ from functools import lru_cache
+ 
+ import attrs
+-from pyperscan import Flag, Pattern, Scan, StreamDatabase
++from unblob.windows_hyperscan import Flag, Pattern, Scan, StreamDatabase
+ from structlog import get_logger
+ 
+ from .file_utils import DEFAULT_BUFSIZE, InvalidInputFormat, SeekError
+@@ -161,6 +161,9 @@
+             "Error scanning for patterns",
+             error=e,
+         )
++        raise
++    finally:
++        scanner.close()
+ 
+     logger.debug(
+         "Ended searching for chunks",
+--- a/python/unblob/handlers/archive/_safe_tarfile.py
++++ b/python/unblob/handlers/archive/_safe_tarfile.py
+@@ -1,4 +1,5 @@
+ import os
++import sys
+ import tarfile
+ from pathlib import Path
+ from typing import Literal
+@@ -10,7 +11,7 @@
+ 
+ logger = get_logger()
+ 
+-RUNNING_AS_ROOT = os.getuid() == 0
++RUNNING_AS_ROOT = hasattr(os, "getuid") and os.getuid() == 0
+ MAX_PATH_LEN = 255
+ 
+ 
+@@ -143,6 +144,17 @@
+             )
+             return
+ 
++        if sys.platform == "win32":
++            from unblob.windows_archive_paths import checked_windows_archive_path
++
++            try:
++                checked_windows_archive_path(extract_root, tarinfo.name, posix_source=True)
++                if tarinfo.islnk() or tarinfo.issym():
++                    checked_windows_archive_path(extract_root, tarinfo.linkname, posix_source=True)
++            except ValueError as error:
++                self.record_problem(tarinfo, str(error), "Skipped; original archive coordinates retained.")
++                return
++
+         # we do want to extract absolute paths, but they must be changed to prevent path traversal
+         if Path(tarinfo.name).is_absolute():
+             self.record_problem(
+--- a/python/unblob/handlers/archive/arc.py
++++ b/python/unblob/handlers/archive/arc.py
+@@ -1,3 +1,7 @@
++import sys
++import struct
++from unblob.windows_xad import WindowsXadExtractor
++
+ from structlog import get_logger
+ 
+ from unblob.extractors.command import Command
+@@ -8,7 +12,7 @@
+     HandlerType,
+     HexString,
+     Reference,
+-    StructHandler,
++    Handler,
+     ValidChunk,
+ )
+ 
+@@ -17,36 +21,22 @@
+ END_HEADER = b"\x1a\x00"
+ 
+ 
+-class ARCHandler(StructHandler):
++class ARCHandler(Handler):
+     NAME = "arc"
+ 
+     PATTERNS = [
+         HexString(
+             """
+             // Each entry in an archive begins with a one byte archive marker set to 0x1A.
+-            // The marker is followed by a one byte header type code, from 0x0 to 0x7.
++            // The marker is followed by a one byte header type code, from 0x1 to 0x9 for the admitted classic methods.
+             // Then a null-byte or uninitialized-byte terminated filename string of 13 bytes, the
+             // uninitialized byte is always set between 0xf0 and 0xff.
+-            1A (01 | 02 | 03 | 04 | 05 | 06 | 07) [12] (00 | F0 | F1 | F2 | F3 | F4 | F5 | F6 | F7 | F8 | F9 | FA | FB | FC | FD | FE | FF)
++            1A (01 | 02 | 03 | 04 | 05 | 06 | 07 | 08 | 09) [12] (00 | F0 | F1 | F2 | F3 | F4 | F5 | F6 | F7 | F8 | F9 | FA | FB | FC | FD | FE | FF)
+             """
+         )
+     ]
+ 
+-    C_DEFINITIONS = r"""
+-    typedef struct arc_head {			/* archive entry header format */
+-        int8 archive_marker;
+-        int8 header_type;
+-        char    name[13];		/* file name */
+-        ulong file_size;	/* size of file, in bytes */
+-        ushort date;	/* creation date */
+-        ushort time;	/* creation time */
+-        short crc;	/* cyclic redundancy check */
+-        ulong length;	/* true file length */
+-    } arc_head_t;
+-    """
+-
+-    HEADER_STRUCT = "arc_head_t"
+-    EXTRACTOR = Command("unar", "-no-directory", "-o", "{outdir}", "{inpath}")
++    EXTRACTOR = WindowsXadExtractor("arc") if sys.platform == "win32" else Command("unar", "-no-directory", "-o", "{outdir}", "{inpath}")
+ 
+     DOC = HandlerDoc(
+         name="ARC",
+@@ -62,44 +52,40 @@
+         limitations=[],
+     )
+ 
+-    def valid_name(self, name: bytes) -> bool:
+-        try:
+-            # we return False if the name is made out of an array of null bytes
+-            # or if name starts with null.
+-            return bool(
+-                not name.startswith(b"\x00")
+-                and name[:-1].strip(b"\x00").decode("utf-8")
+-            )
+-        except UnicodeDecodeError:
+-            return False
+-
+-    def valid_header(self, header) -> bool:
+-        if header.archive_marker != 0x1A:
+-            return False
+-        if header.header_type > 0x07:
+-            return False
+-        if not self.valid_name(header.name):  # noqa: SIM103
+-            return False
+-        return True
+-
+     def calculate_chunk(self, file: File, start_offset: int) -> ValidChunk | None:
+-        # we loop from header to header until we reach the end header
++        # The producing boundary owns method-dependent header lengths. Old
++        # stored entries (method 1) omit the four-byte uncompressed length.
+         offset = start_offset
+-        while True:
++        file_size = file.size()
++        entries = 0
++        while offset + 2 <= file_size:
+             file.seek(offset)
+-            read_bytes = file.read(2)
+-
+-            if read_bytes == END_HEADER:
+-                offset += 2
+-                break
++            marker = file.read(2)
++            if marker == END_HEADER:
++                if not entries:
++                    return None
++                return ValidChunk(start_offset=start_offset, end_offset=offset + 2)
++            if marker[0] != 0x1A or not 1 <= marker[1] <= 9:
++                if entries:
++                    raise ValueError("Invalid ARC continuation marker")
++                return None
++            if entries >= 10000:
++                raise ValueError("ARC inventory exceeds its 10000-entry bound")
++            header_size = 25 if marker[1] == 1 else 29
+             file.seek(offset)
+-            header = self.parse_header(file)
+-            if not self.valid_header(header):
++            header = file.read(header_size)
++            if len(header) != header_size:
++                raise EOFError("Truncated ARC entry header")
++            name = header[2:15]
++            # ARC names are source bytes (often OEM), not UTF-8 host paths.
++            # Windows extraction maps them to numbered regular files.
++            if name[0] == 0 or name[-1] not in (0, *range(0xF0, 0x100)):
++                if entries:
++                    raise ValueError("Invalid ARC continuation name")
+                 return None
+-
+-            offset += len(header) + header.file_size
+-
+-        return ValidChunk(
+-            start_offset=start_offset,
+-            end_offset=offset,
+-        )
++            packed = struct.unpack_from("<I", header, 15)[0]
++            if packed > file_size - offset - header_size:
++                raise EOFError("ARC entry exceeds the supplied file")
++            offset += header_size + packed
++            entries += 1
++        raise EOFError("Missing ARC end marker")
+--- a/python/unblob/handlers/archive/arj.py
++++ b/python/unblob/handlers/archive/arj.py
+@@ -1,3 +1,6 @@
++import sys
++from unblob.windows_sevenzip import WindowsSevenZipExtractor
++
+ import binascii
+ import io
+ 
+@@ -106,7 +109,7 @@
+ 
+     HEADER_STRUCT = "arj_header_t"
+ 
+-    EXTRACTOR = Command("7z", "x", "-y", "{inpath}", "-o{outdir}")
++    EXTRACTOR = (WindowsSevenZipExtractor("arj") if sys.platform == "win32" else Command("7z", "x", "-y", "{inpath}", "-o{outdir}"))
+ 
+     DOC = HandlerDoc(
+         name="ARJ",
+--- a/python/unblob/handlers/archive/cab.py
++++ b/python/unblob/handlers/archive/cab.py
+@@ -1,6 +1,9 @@
+ from structlog import get_logger
+ 
++import sys
++
+ from ...extractors import Command
++from unblob.windows_libarchive import WindowsLibarchiveExtractor
+ from ...models import (
+     File,
+     HandlerDoc,
+@@ -46,7 +49,7 @@
+     """
+     HEADER_STRUCT = "cab_header_t"
+ 
+-    EXTRACTOR = Command("7z", "x", "-y", "{inpath}", "-o{outdir}")
++    EXTRACTOR = WindowsLibarchiveExtractor("cab") if sys.platform == "win32" else Command("7z", "x", "-y", "{inpath}", "-o{outdir}")
+ 
+     DOC = HandlerDoc(
+         name="CAB",
+--- a/python/unblob/handlers/archive/cpio.py
++++ b/python/unblob/handlers/archive/cpio.py
+@@ -116,10 +116,11 @@
+ class CPIOEntry:
+     start_offset: int
+     size: int
+-    dev: int
++    dev: int | tuple[int, int]
+     mode: int
+-    rdev: int
++    rdev: int | tuple[int, int]
+     path: Path
++    source_name: str
+ 
+ 
+ class CPIOParserBase:
+@@ -169,6 +170,9 @@
+                     "CPIO entry filename is not null-byte terminated"
+                 )
+ 
++            if b"\x00" in tmp_filename.rstrip(b"\x00"):
++                raise InvalidInputFormat("CPIO filename contains an embedded NUL byte.")
++
+             try:
+                 filename = snull(tmp_filename).decode("utf-8")
+             except UnicodeDecodeError as e:
+@@ -197,6 +201,7 @@
+                         mode=c_mode,
+                         rdev=self._calculate_rdev(header),
+                         path=Path(filename),
++                        source_name=filename,
+                     )
+                 )
+             else:
+@@ -210,6 +215,14 @@
+ 
+     def dump_entries(self, fs: FileSystem):
+         for entry in self.entries:
++            if os.name == "nt":
++                from unblob.windows_archive_paths import checked_windows_archive_path
++                from unblob.report import ExtractionProblem
++                try:
++                    checked_windows_archive_path(fs.root, entry.source_name, posix_source=True)
++                except ValueError as error:
++                    fs.record_problem(ExtractionProblem(path=entry.source_name, problem=str(error), resolution="Skipped; original archive coordinates retained."))
++                    continue
+             # skip entries with "." as filename
+             if entry.path.name in ("", "."):
+                 continue
+@@ -238,7 +251,19 @@
+                 or stat.S_ISSOCK(entry.mode)
+                 or stat.S_ISSOCK(entry.mode)
+             ):
+-                fs.mknod(entry.path, mode=entry.mode & 0o777, device=entry.rdev)
++                device = entry.rdev
++                if isinstance(device, tuple):
++                    if not hasattr(os, "makedev"):
++                        from unblob.report import ArchiveDeviceExtractionProblem
++                        fs.record_problem(ArchiveDeviceExtractionProblem(
++                            path=str(entry.path), mode=entry.mode,
++                            device_major=device[0], device_minor=device[1],
++                            problem="Archive contains a POSIX special device entry.",
++                            resolution="Device numbers retained as metadata; no host device created.",
++                        ))
++                        continue
++                    device = os.makedev(*device)
++                fs.mknod(entry.path, mode=entry.mode & 0o777, device=device)
+             else:
+                 logger.warning("unknown file type in CPIO archive")
+ 
+@@ -277,11 +302,11 @@
+         raise NotImplementedError
+ 
+     @staticmethod
+-    def _calculate_dev(header) -> int:
++    def _calculate_dev(header) -> int | tuple[int, int]:
+         raise NotImplementedError
+ 
+     @staticmethod
+-    def _calculate_rdev(header) -> int:
++    def _calculate_rdev(header) -> int | tuple[int, int]:
+         raise NotImplementedError
+ 
+     def valid_checksum(self, header, start_offset: int) -> bool:  # noqa: ARG002
+@@ -357,14 +382,14 @@
+         return decode_int(header.c_mode, 16)
+ 
+     @staticmethod
+-    def _calculate_dev(header) -> int:
+-        return os.makedev(
++    def _calculate_dev(header) -> tuple[int, int]:
++        return (
+             decode_int(header.c_dev_maj, 16), decode_int(header.c_dev_min, 16)
+         )
+ 
+     @staticmethod
+-    def _calculate_rdev(header) -> int:
+-        return os.makedev(
++    def _calculate_rdev(header) -> tuple[int, int]:
++        return (
+             decode_int(header.c_rdev_maj, 16), decode_int(header.c_rdev_min, 16)
+         )
+ 
+@@ -390,6 +415,7 @@
+             parser = self.PARSER(file, 0)
+             parser.parse()
+             parser.dump_entries(fs)
++        return ExtractResult(reports=fs.problems)
+ 
+ 
+ class BinaryCPIOExtractor(_CPIOExtractorBase):
+--- a/python/unblob/handlers/archive/dmg.py
++++ b/python/unblob/handlers/archive/dmg.py
+@@ -1,3 +1,6 @@
++import sys
++from unblob.windows_sevenzip import WindowsSevenZipExtractor
++
+ from structlog import get_logger
+ 
+ from unblob.extractors.command import Command
+@@ -70,9 +73,9 @@
+     # This directory is here for simulating hardlinks and other metadata
+     # but the files will be extracted anyway, and we only care about the content
+     # See more about this problem: https://newbedev.com/hfs-private-directory-data
+-    EXTRACTOR = Command(
++    EXTRACTOR = (WindowsSevenZipExtractor("dmg") if sys.platform == "win32" else Command(
+         "7z", "x", "-xr!*HFS+ Private Data*", "-y", "{inpath}", "-o{outdir}"
+-    )
++    ))
+ 
+     DOC = HandlerDoc(
+         name="DMG",
+--- a/python/unblob/handlers/archive/msi.py
++++ b/python/unblob/handlers/archive/msi.py
+@@ -1,3 +1,6 @@
++import sys
++from unblob.windows_sevenzip import WindowsSevenZipExtractor
++
+ import io
+ import struct
+ 
+@@ -65,7 +68,7 @@
+     """
+     HEADER_STRUCT = "cfbf_header_t"
+ 
+-    EXTRACTOR = Command("7z", "x", "-p", "-y", "{inpath}", "-o{outdir}")
++    EXTRACTOR = (WindowsSevenZipExtractor("msi") if sys.platform == "win32" else Command("7z", "x", "-p", "-y", "{inpath}", "-o{outdir}"))
+ 
+     DOC = HandlerDoc(
+         name="MSI",
+--- a/python/unblob/handlers/archive/partclone.py
++++ b/python/unblob/handlers/archive/partclone.py
+@@ -1,6 +1,7 @@
+ import binascii
+ import io
+-from math import ceil
++import sys
++from unblob.windows_partclone import WindowsPartcloneExtractor
+ 
+ from unblob.extractors import Command
+ from unblob.file_utils import File, InvalidInputFormat, get_endian_short
+@@ -42,12 +43,44 @@
+ ENDIAN_OFFSET = 34
+ 
+ 
++def partclone_image_layout(header):
++    """Own the on-disk extents for the v2 header used by both adapters."""
++    if (header.magic != b"partclone-image\0" or header.image_version_txt != b"0002"
++            or header.image_version != 2 or header.feature_size != 18
++            or header.number_of_bits_for_CPU not in (32, 64)
++            or header.reseed_checksum not in (0, 1)):
++        raise InvalidInputFormat("Unsupported or inconsistent Partclone v2 header")
++    blocks, used, size = header.fs_total_block_count, header.fs_used_block_count_bitmap, header.fs_block_size
++    if (not blocks or not size or used > blocks
++            or not (blocks - 1) * size < header.fs_size <= blocks * size):
++        raise InvalidInputFormat("Invalid Partclone filesystem geometry")
++    checksums = {0: 0, 0x20: 4, 0x30: 8, 0x31: 16}
++    if (header.checksum_mode not in checksums
++            or header.checksum_size != checksums[header.checksum_mode]
++            or (header.checksum_mode and not header.blocks_per_checksum)
++            or (not header.checksum_mode and header.blocks_per_checksum)):
++        raise InvalidInputFormat("Inconsistent Partclone checksum mode or group size")
++    if header.bitmap_mode == 1:
++        bitmap_bytes, trailer_bytes = (blocks + 7) // 8, 4
++    elif header.bitmap_mode == 0:
++        if used != blocks:
++            raise InvalidInputFormat("Partclone bitmap-free image omits blocks")
++        bitmap_bytes, trailer_bytes = 0, 0
++    elif header.bitmap_mode == 8:
++        bitmap_bytes, trailer_bytes = blocks, 4
++    else:
++        raise InvalidInputFormat("Unknown Partclone bitmap mode")
++    groups = (used + header.blocks_per_checksum - 1) // header.blocks_per_checksum if header.checksum_mode else 0
++    return {'bitmap_bytes': bitmap_bytes, 'bitmap_trailer_bytes': trailer_bytes,
++            'image_bytes': len(header) + bitmap_bytes + trailer_bytes + used * size + groups * header.checksum_size}
++
++
+ class PartcloneHandler(StructHandler):
+     NAME = "partclone"
+     PATTERNS = [Regex(r"partclone-image\x00\d+\.\d+\.\d+.*?0002(\xde\xc0|\xc0\xde)")]
+     HEADER_STRUCT = HEADER_STRUCT
+     C_DEFINITIONS = C_DEFINITIONS
+-    EXTRACTOR = Command(
++    EXTRACTOR = WindowsPartcloneExtractor() if sys.platform == "win32" else Command(
+         "partclone.restore",
+         "-W",
+         "-s",
+@@ -81,24 +114,16 @@
+             header.crc32 ^ 0xFFFFFFFF
+         ) == calculated_crc  # partclone does not final XOR
+ 
++    def read_image_header(self, file, start_offset):
++        file.seek(start_offset + ENDIAN_OFFSET, io.SEEK_SET)
++        endian = get_endian_short(file, BIG_ENDIAN_MAGIC)
++        file.seek(start_offset, io.SEEK_SET)
++        header = self.parse_header(file, endian)
++        if not self.is_valid_header(header):
++            raise InvalidInputFormat("Invalid Partclone header CRC32")
++        return header
++
+     def calculate_chunk(self, file: File, start_offset: int) -> ValidChunk | None:
+-        file.seek(start_offset + ENDIAN_OFFSET, io.SEEK_SET)  # go to endian
+-        endian = get_endian_short(file, BIG_ENDIAN_MAGIC)
+-        file.seek(start_offset, io.SEEK_SET)  # go to beginning of file
+-        header = self.parse_header(file, endian)
+-
+-        if not self.is_valid_header(header):
+-            raise InvalidInputFormat("Invalid partclone header.")
+-
+-        end_offset = start_offset + len(header)  # header
+-        end_offset += header.checksum_size  # checksum size
+-        end_offset += ceil(header.fs_total_block_count / 8)  # bitmap, as bytes
+-
+-        if header.checksum_mode != 0:
+-            checksum_blocks = ceil(
+-                header.fs_used_block_count_bitmap / header.blocks_per_checksum
+-            )
+-            end_offset += checksum_blocks * header.checksum_size
+-
+-        end_offset += header.fs_used_block_count_bitmap * header.fs_block_size  # Data
+-        return ValidChunk(start_offset=start_offset, end_offset=end_offset)
++        header = self.read_image_header(file, start_offset)
++        layout = partclone_image_layout(header)
++        return ValidChunk(start_offset=start_offset, end_offset=start_offset + layout['image_bytes'])
+--- a/python/unblob/handlers/archive/qnap/qnap_nas.py
++++ b/python/unblob/handlers/archive/qnap/qnap_nas.py
+@@ -1,7 +1,7 @@
+ import io
+ 
+ import attrs
+-from pyperscan import Flag, Pattern, Scan, StreamDatabase
++from unblob.windows_hyperscan import Flag, Pattern, Scan, StreamDatabase
+ from structlog import get_logger
+ 
+ from unblob.file_utils import File, stream_scan
+--- a/python/unblob/handlers/archive/rar.py
++++ b/python/unblob/handlers/archive/rar.py
+@@ -10,7 +10,10 @@
+ import rarfile
+ from structlog import get_logger
+ 
++import sys
++
+ from unblob.extractors import Command
++from unblob.windows_libarchive import WindowsLibarchiveExtractor
+ 
+ from ...models import (
+     File,
+@@ -36,7 +39,7 @@
+         """
+         )
+     ]
+-    EXTRACTOR = Command("unar", "-no-directory", "-p", "", "{inpath}", "-o", "{outdir}")
++    EXTRACTOR = WindowsLibarchiveExtractor("rar") if sys.platform == "win32" else Command("unar", "-no-directory", "-p", "", "{inpath}", "-o", "{outdir}")
+ 
+     DOC = HandlerDoc(
+         name="RAR",
+--- a/python/unblob/handlers/archive/sevenzip.py
++++ b/python/unblob/handlers/archive/sevenzip.py
+@@ -19,11 +19,15 @@
+ """
+ 
+ import binascii
++import re
+ from pathlib import Path
+ 
+ from structlog import get_logger
+ 
++import sys
++
+ from unblob.extractors import Command
++from unblob.windows_libarchive import WindowsLibarchiveExtractor, WindowsMultiSevenZipExtractor
+ 
+ from ...extractors.command import MultiFileCommand
+ from ...file_utils import Endian, InvalidInputFormat, StructParser
+@@ -90,7 +94,7 @@
+     ]
+     C_DEFINITIONS = C_DEFINITIONS
+     HEADER_STRUCT = HEADER_STRUCT
+-    EXTRACTOR = Command("7z", "x", "-p", "-y", "{inpath}", "-o{outdir}")
++    EXTRACTOR = WindowsLibarchiveExtractor("7zip") if sys.platform == "win32" else Command("7z", "x", "-p", "-y", "{inpath}", "-o{outdir}")
+ 
+     DOC = HandlerDoc(
+         name="7-Zip",
+@@ -118,7 +122,7 @@
+ 
+ class MultiVolumeSevenZipHandler(DirectoryHandler):
+     NAME = "multi-sevenzip"
+-    EXTRACTOR = MultiFileCommand("7z", "x", "-p", "-y", "{inpath}", "-o{outdir}")
++    EXTRACTOR = WindowsMultiSevenZipExtractor() if sys.platform == "win32" else MultiFileCommand("7z", "x", "-p", "-y", "{inpath}", "-o{outdir}")
+ 
+     PATTERN = Glob("*.7z.001")
+ 
+@@ -137,31 +141,31 @@
+     )
+ 
+     def calculate_multifile(self, file: Path) -> MultiFile | None:
+-        paths = sorted(
+-            [p for p in file.parent.glob(f"{file.stem}.*") if p.resolve().exists()]
+-        )
+-        if not paths:
++        with file.open("rb") as source:
++            data = source.read(HEADER_SIZE)
++        if len(data) < HEADER_SIZE or data[:6] != SEVENZIP_MAGIC:
+             return None
+-
+-        with file.open("rb") as f:
+-            header_data = f.read(HEADER_SIZE)
+-
+-        header = HEADER_PARSER.parse(HEADER_STRUCT, header_data, Endian.LITTLE)
+-        if header.magic != SEVENZIP_MAGIC:
+-            return None
+-
++        header = HEADER_PARSER.parse(HEADER_STRUCT, data, Endian.LITTLE)
+         check_header_crc(header)
+-        size = calculate_sevenzip_size(header)
+-        logger.debug("Sevenzip header", header=header, size=size, _verbosity=3)
+-
+-        files_size = sum(path.stat().st_size for path in paths)
+-        logger.debug(
+-            "Multi-volume files", paths=paths, files_size=files_size, _verbosity=2
+-        )
+-        if files_size != size:
+-            return None
+-
+-        return MultiFile(
+-            name=file.stem,
+-            paths=paths,
+-        )
++        expected = calculate_sevenzip_size(header)
++        # After a verified header, missing parts are an incomplete archive,
++        # not a pattern mismatch. Keep that failure in the public report.
++        pattern = re.compile(re.escape(file.stem) + r"\.([0-9]+)$")
++        numbered = []
++        for path in file.parent.iterdir():
++            match = pattern.fullmatch(path.name)
++            if not match:
++                continue
++            if path.is_symlink() or not path.is_file():
++                raise ValueError("7z volume is not a regular admitted file")
++            numbered.append((int(match.group(1)), path))
++            if len(numbered) > 10000:
++                raise ValueError("7z volume inventory exceeds its entry bound")
++        numbered.sort(key=lambda item: item[0])
++        if [number for number, _ in numbered] != list(range(1, len(numbered) + 1)):
++            raise EOFError("7z numbered volumes are missing or duplicated")
++        paths = [path for _, path in numbered]
++        observed = sum(path.stat().st_size for path in paths)
++        if observed != expected:
++            raise EOFError(f"7z volume extent is incomplete or inconsistent: {observed} observed, {expected} declared bytes")
++        return MultiFile(name=file.stem, paths=paths)
+--- a/python/unblob/handlers/archive/stuffit.py
++++ b/python/unblob/handlers/archive/stuffit.py
+@@ -17,6 +17,9 @@
+ If you have the resources to add support for these archive formats,
+ feel free to do so !
+ """
++
++import sys
++from unblob.windows_xad import WindowsXadExtractor
+ 
+ from structlog import get_logger
+ 
+@@ -46,7 +49,7 @@
+             end_offset=start_offset + header.archive_length,
+         )
+ 
+-    EXTRACTOR = Command("unar", "-no-directory", "-o", "{outdir}", "{inpath}")
++    EXTRACTOR = WindowsXadExtractor("stuffit") if sys.platform == "win32" else Command("unar", "-no-directory", "-o", "{outdir}", "{inpath}")
+ 
+ 
+ class StuffItSITHandler(_StuffItHandlerBase):
+@@ -72,7 +75,7 @@
+     """
+     HEADER_STRUCT = "sit_header_t"
+ 
+-    EXTRACTOR = Command("unar", "-no-directory", "-o", "{outdir}", "{inpath}")
++    EXTRACTOR = WindowsXadExtractor("stuffit") if sys.platform == "win32" else Command("unar", "-no-directory", "-o", "{outdir}", "{inpath}")
+ 
+     DOC = HandlerDoc(
+         name="Stuffit SIT",
+@@ -114,7 +117,7 @@
+     """
+     HEADER_STRUCT = "stuffit5_header_t"
+ 
+-    EXTRACTOR = Command("unar", "-no-directory", "-o", "{outdir}", "{inpath}")
++    EXTRACTOR = WindowsXadExtractor("stuffit5") if sys.platform == "win32" else Command("unar", "-no-directory", "-o", "{outdir}", "{inpath}")
+ 
+     DOC = HandlerDoc(
+         name="Stuffit SIT (v5)",
+--- a/python/unblob/handlers/archive/zip.py
++++ b/python/unblob/handlers/archive/zip.py
+@@ -2,6 +2,9 @@
+ import struct
+ 
+ from structlog import get_logger
++
++import sys
++from unblob.windows_zip_extractor import WindowsZipExtractor
+ 
+ from ...extractors import Command
+ from ...file_utils import InvalidInputFormat, iterate_patterns
+@@ -85,7 +88,7 @@
+     HEADER_STRUCT = "end_of_central_directory_t"
+ 
+     # empty password with -p will make sure the command will not hang
+-    EXTRACTOR = Command("7z", "x", "-p", "-y", "{inpath}", "-o{outdir}")
++    EXTRACTOR = WindowsZipExtractor() if sys.platform == "win32" else Command("7z", "x", "-p", "-y", "{inpath}", "-o{outdir}")
+ 
+     DOC = HandlerDoc(
+         name="ZIP",
+--- a/python/unblob/handlers/compression/bzip2.py
++++ b/python/unblob/handlers/compression/bzip2.py
+@@ -1,6 +1,9 @@
+ import attrs
+-from pyperscan import Flag, Pattern, Scan, StreamDatabase
++from unblob.windows_hyperscan import Flag, Pattern, Scan, StreamDatabase
+ from structlog import get_logger
++
++import sys
++from unblob.windows_stream_extractors import WindowsStreamExtractor
+ 
+ from unblob.extractors import Command
+ 
+@@ -133,7 +136,7 @@
+     # magic + version + block_size + block header magic
+     PATTERNS = [Regex(r"\x42\x5a\x68[\x31-\x39]\x31\x41\x59\x26\x53\x59")]
+ 
+-    EXTRACTOR = Command("7z", "x", "-y", "{inpath}", "-so", stdout="bzip2.uncompressed")
++    EXTRACTOR = WindowsStreamExtractor('bz2', 'bzip2.uncompressed') if sys.platform == "win32" else Command("7z", "x", "-y", "{inpath}", "-so", stdout="bzip2.uncompressed")
+ 
+     DOC = HandlerDoc(
+         name=NAME,
+--- a/python/unblob/handlers/compression/gzip.py
++++ b/python/unblob/handlers/compression/gzip.py
+@@ -22,6 +22,9 @@
+ from pathlib import Path
+ 
+ from structlog import get_logger
++
++import sys
++from unblob.windows_stream_extractors import WindowsStreamExtractor
+ 
+ from unblob.extractors import Command
+ from unblob.extractors.command import MultiFileCommand
+@@ -83,20 +86,24 @@
+ 
+ class GZIPExtractor(Extractor):
+     def get_dependencies(self) -> list[str]:
+-        return ["7z"]
++        return [] if sys.platform == "win32" else ["7z"]
+ 
+     def extract(self, inpath: Path, outdir: Path) -> ExtractResult | None:
+         name = get_gzip_embedded_name(inpath) or "gzip.uncompressed"
++        if sys.platform == "win32":
++            return WindowsStreamExtractor("gzip", name).extract(inpath, outdir)
+         extractor = Command("7z", "x", "-y", "{inpath}", "-so", stdout=name)
+         return extractor.extract(inpath, outdir)
+ 
+ 
+ class MultiGZIPExtractor(DirectoryExtractor):
+     def get_dependencies(self) -> list[str]:
+-        return ["7z"]
++        return [] if sys.platform == "win32" else ["7z"]
+ 
+     def extract(self, paths: list[Path], outdir: Path) -> ExtractResult | None:
+         name = get_gzip_embedded_name(paths[0]) or "gzip.uncompressed"
++        if sys.platform == "win32":
++            return WindowsStreamExtractor("gzip", name).extract_paths(paths, outdir)
+         extractor = MultiFileCommand(
+             "7z", "x", "-p", "-y", "{inpath}", "-so", stdout=name
+         )
+--- a/python/unblob/handlers/compression/lz4.py
++++ b/python/unblob/handlers/compression/lz4.py
+@@ -7,6 +7,9 @@
+ 
+ from lz4.block import LZ4BlockError, decompress
+ from structlog import get_logger
++
++import sys
++from unblob.windows_stream_extractors import WindowsStreamExtractor
+ 
+ from unblob.extractors import Command
+ 
+@@ -76,7 +79,7 @@
+     def _skip_magic_bytes(self, file: File):
+         file.seek(MAGIC_LEN, io.SEEK_CUR)
+ 
+-    EXTRACTOR = Command("lz4", "--decompress", "{inpath}", "{outdir}/lz4.uncompressed")
++    EXTRACTOR = WindowsStreamExtractor('lz4', 'lz4.uncompressed') if sys.platform == "win32" else Command("lz4", "--decompress", "{inpath}", "{outdir}/lz4.uncompressed")
+ 
+ 
+ class LegacyFrameHandler(_LZ4HandlerBase):
+--- a/python/unblob/handlers/compression/lzma.py
++++ b/python/unblob/handlers/compression/lzma.py
+@@ -2,6 +2,9 @@
+ import lzma
+ 
+ from structlog import get_logger
++
++import sys
++from unblob.windows_stream_extractors import WindowsStreamExtractor
+ 
+ from unblob.extractors import Command
+ 
+@@ -51,7 +54,7 @@
+         )
+     ]
+ 
+-    EXTRACTOR = Command("7z", "x", "-y", "{inpath}", "-so", stdout="lzma.uncompressed")
++    EXTRACTOR = WindowsStreamExtractor('lzma', 'lzma.uncompressed') if sys.platform == "win32" else Command("7z", "x", "-y", "{inpath}", "-so", stdout="lzma.uncompressed")
+ 
+     DOC = HandlerDoc(
+         name="LZMA",
+--- a/python/unblob/handlers/compression/xz.py
++++ b/python/unblob/handlers/compression/xz.py
+@@ -1,8 +1,11 @@
+ import io
+ 
+ import attrs
+-from pyperscan import Flag, Pattern, Scan, StreamDatabase
++from unblob.windows_hyperscan import Flag, Pattern, Scan, StreamDatabase
+ from structlog import get_logger
++
++import sys
++from unblob.windows_stream_extractors import WindowsStreamExtractor
+ 
+ from unblob.extractors import Command
+ 
+@@ -174,7 +177,7 @@
+ 
+     PATTERNS = [HexString("FD 37 7A 58 5A 00")]
+ 
+-    EXTRACTOR = Command("7z", "x", "-y", "{inpath}", "-so", stdout="xz.uncompressed")
++    EXTRACTOR = WindowsStreamExtractor('xz', 'xz.uncompressed') if sys.platform == "win32" else Command("7z", "x", "-y", "{inpath}", "-so", stdout="xz.uncompressed")
+ 
+     DOC = HandlerDoc(
+         name="XZ",
+--- a/python/unblob/handlers/compression/zstd.py
++++ b/python/unblob/handlers/compression/zstd.py
+@@ -1,6 +1,9 @@
+ import io
+ 
+ from structlog import get_logger
++
++import sys
++from unblob.windows_stream_extractors import WindowsStreamExtractor
+ 
+ from unblob.extractors import Command
+ 
+@@ -31,7 +34,7 @@
+ 
+     PATTERNS = [HexString("28 B5 2F FD")]
+ 
+-    EXTRACTOR = Command("zstd", "-d", "{inpath}", "-o", "{outdir}/zstd.uncompressed")
++    EXTRACTOR = WindowsStreamExtractor('zstd', 'zstd.uncompressed') if sys.platform == "win32" else Command("zstd", "-d", "{inpath}", "-o", "{outdir}/zstd.uncompressed")
+ 
+     DOC = HandlerDoc(
+         name="ZSTD",
+--- a/python/unblob/handlers/filesystem/android/erofs.py
++++ b/python/unblob/handlers/filesystem/android/erofs.py
+@@ -1,4 +1,7 @@
+ import io
++import sys
++
++from unblob.windows_erofs import WindowsErofsExtractor
+ 
+ from unblob.extractors import Command
+ from unblob.file_utils import (
+@@ -45,7 +48,7 @@
+     PATTERNS = [HexString("e2 e1 f5 e0")]  # Magic in little endian
+     HEADER_STRUCT = "erofs_handler_t"
+     C_DEFINITIONS = C_DEFINITIONS
+-    EXTRACTOR = Command(
++    EXTRACTOR = WindowsErofsExtractor() if sys.platform == "win32" else Command(
+         "fsck.erofs",
+         "--no-preserve",
+         "--extract={outdir}",
+@@ -78,8 +81,7 @@
+             return False
+         return (
+             header.block_count >= 1
+-            and header.build_time > 0
+-            and header.block_size_bs >= 9
++            and 9 <= header.block_size_bs <= 16
+         )
+ 
+     def calculate_chunk(self, file: File, start_offset: int) -> ValidChunk | None:
+--- a/python/unblob/handlers/filesystem/android/sparse.py
++++ b/python/unblob/handlers/filesystem/android/sparse.py
+@@ -1,10 +1,14 @@
+ import io
++import sys
++from dataclasses import dataclass
++
++from unblob.windows_sparse_extractor import WindowsSparseExtractor
+ 
+ from structlog import get_logger
+ 
+ from unblob.extractors.command import Command
+ 
+-from ....file_utils import Endian, InvalidInputFormat
++from ....file_utils import Endian
+ from ....models import (
+     File,
+     HandlerDoc,
+@@ -30,6 +34,15 @@
+ ]
+ 
+ 
++@dataclass(frozen=True)
++class SparseChunk:
++    chunk_type: int
++    data_offset: int
++    input_size: int
++    output_offset: int
++    output_size: int
++
++
+ class SparseHandler(StructHandler):
+     NAME = "sparse"
+ 
+@@ -38,7 +51,7 @@
+     # minor version (any)
+     # file header size (0x1C in v1.0)
+     # chunk header size (0XC in v1.0)
+-    PATTERNS = [Regex(r"\x3A\xFF\x26\xED\x01\x00[\x00-\xFF]{2}\x1C\x00\x0C\x00")]
++    PATTERNS = [Regex(r"\x3A\xFF\x26\xED\x01\x00[\x00-\xFF]{2}")]
+ 
+     C_DEFINITIONS = r"""
+         typedef struct sparse_header {
+@@ -64,7 +77,7 @@
+     """
+     HEADER_STRUCT = "sparse_header_t"
+ 
+-    EXTRACTOR = Command("simg2img", "{inpath}", "{outdir}/raw.image")
++    EXTRACTOR = WindowsSparseExtractor() if sys.platform == "win32" else Command("simg2img", "{inpath}", "{outdir}/raw.image")
+ 
+     DOC = HandlerDoc(
+         name="Android Sparse",
+@@ -84,23 +97,54 @@
+         limitations=[],
+     )
+ 
++    def read_layout(self, file, start_offset=0):
++        """Own all sparse header/extents for carving and materialization."""
++        file.seek(0, io.SEEK_END)
++        input_end = file.tell()
++        file.seek(start_offset)
++        header = self.parse_header(file, Endian.LITTLE)
++        if (header.magic != 0xED26FF3A or header.major_version != 1
++                or header.file_hdr_sz < 28 or header.chunk_hdr_sz < 12
++                or not header.blk_sz or header.blk_sz % 4):
++            raise ValueError("Invalid Android sparse header")
++        cursor = start_offset + header.file_hdr_sz
++        if cursor > input_end or header.total_chunks > (input_end-cursor)//header.chunk_hdr_sz:
++            raise EOFError("Sparse headers exceed the supplied input extent")
++        file.seek(cursor)
++
++        def chunks():
++            nonlocal cursor
++            total = 0
++            expected = header.total_blks * header.blk_sz
++            for _ in range(header.total_chunks):
++                if header.chunk_hdr_sz > input_end-cursor:
++                    raise EOFError("Truncated Android sparse chunk header")
++                file.seek(cursor)
++                chunk = self.cparser_le.chunk_header_t(file)
++                size = chunk.total_sz-header.chunk_hdr_sz
++                expanded = chunk.chunk_sz*header.blk_sz
++                if size < 0 or chunk.total_sz > input_end-cursor:
++                    raise EOFError("Sparse chunk exceeds the supplied input extent")
++                if expanded > expected-total:
++                    raise ValueError("Sparse chunks exceed the declared output extent")
++                required = {CHUNK_TYPE_RAW: expanded, CHUNK_TYPE_FILL: 4,
++                    CHUNK_TYPE_DONT_CARE: 0, CHUNK_TYPE_CRC32: 4}.get(chunk.chunk_type)
++                if required is None or size != required:
++                    raise ValueError("Invalid Android sparse chunk type or data length")
++                if chunk.chunk_type == CHUNK_TYPE_CRC32 and chunk.chunk_sz:
++                    raise ValueError("Sparse CRC chunk has nonzero output blocks")
++                data_offset = cursor+header.chunk_hdr_sz
++                file.seek(data_offset)
++                yield SparseChunk(chunk.chunk_type,data_offset,size,total,expanded)
++                total += expanded
++                cursor += chunk.total_sz
++                file.seek(cursor)
++            if total != expected:
++                raise ValueError("Sparse output is shorter than the declared image")
++        return header, chunks()
++
+     def calculate_chunk(self, file: File, start_offset: int) -> ValidChunk | None:
+-        header = self.parse_header(file, Endian.LITTLE)
+-
+-        count = 0
+-        while count < header.total_chunks:
+-            chunk_header = self.cparser_le.chunk_header_t(file)
+-            if chunk_header.chunk_type not in VALID_CHUNK_TYPES:
+-                logger.warning("Invalid chunk type in Android sparse image. Aborting.")
+-                return None
+-            if chunk_header.total_sz < len(chunk_header):
+-                raise InvalidInputFormat(
+-                    "Android sparse chunk size smaller than the chunk header."
+-                )
+-            file.seek(chunk_header.total_sz - len(chunk_header), io.SEEK_CUR)
+-            count += 1
+-
+-        return ValidChunk(
+-            start_offset=start_offset,
+-            end_offset=file.tell(),
+-        )
++        _, chunks = self.read_layout(file, start_offset)
++        for _ in chunks:
++            pass
++        return ValidChunk(start_offset=start_offset, end_offset=file.tell())
+--- a/python/unblob/handlers/filesystem/cramfs.py
++++ b/python/unblob/handlers/filesystem/cramfs.py
+@@ -1,3 +1,6 @@
++import sys
++from unblob.windows_sevenzip import WindowsSevenZipExtractor
++
+ import binascii
+ import struct
+ 
+@@ -46,7 +49,7 @@
+     """
+     HEADER_STRUCT = "cramfs_header_t"
+ 
+-    EXTRACTOR = Command("7z", "x", "-y", "{inpath}", "-o{outdir}")
++    EXTRACTOR = (WindowsSevenZipExtractor("cramfs") if sys.platform == "win32" else Command("7z", "x", "-y", "{inpath}", "-o{outdir}"))
+ 
+     DOC = HandlerDoc(
+         name="CramFS",
+--- a/python/unblob/handlers/filesystem/extfs.py
++++ b/python/unblob/handlers/filesystem/extfs.py
+@@ -1,3 +1,6 @@
++import sys
++from unblob.windows_sevenzip import WindowsSevenZipExtractor
++
+ from pathlib import Path
+ 
+ from structlog import get_logger
+@@ -91,7 +94,7 @@
+ 
+     PATTERN_MATCH_OFFSET = -MAGIC_OFFSET
+ 
+-    EXTRACTOR = ExtFSExtractor("debugfs", "-R", 'rdump / "{outdir}"', "{inpath}")
++    EXTRACTOR = (WindowsSevenZipExtractor("extfs") if sys.platform == "win32" else ExtFSExtractor("debugfs", "-R", 'rdump / "{outdir}"', "{inpath}"))
+ 
+     DOC = HandlerDoc(
+         name="ExtFS",
+--- a/python/unblob/handlers/filesystem/fat.py
++++ b/python/unblob/handlers/filesystem/fat.py
+@@ -1,3 +1,6 @@
++import sys
++from unblob.windows_sevenzip import WindowsSevenZipExtractor
++
+ from pyfatfs._exceptions import PyFATException
+ from pyfatfs.PyFat import PyFat
+ from structlog import get_logger
+@@ -50,7 +53,7 @@
+         )
+     ]
+ 
+-    EXTRACTOR = Command("7z", "x", "-y", "{inpath}", "-o{outdir}")
++    EXTRACTOR = (WindowsSevenZipExtractor("fat") if sys.platform == "win32" else Command("7z", "x", "-y", "{inpath}", "-o{outdir}"))
+ 
+     DOC = HandlerDoc(
+         name="FAT",
+--- a/python/unblob/handlers/filesystem/iso9660.py
++++ b/python/unblob/handlers/filesystem/iso9660.py
+@@ -1,6 +1,9 @@
+ from structlog import get_logger
+ 
++import sys
++
+ from unblob.extractors import Command
++from unblob.windows_libarchive import WindowsLibarchiveExtractor
+ from unblob.file_utils import Endian
+ 
+ from ...models import (
+@@ -115,7 +118,7 @@
+ 
+     HEADER_STRUCT = "iso9660_pvd_t"
+ 
+-    EXTRACTOR = Command("7z", "x", "-y", "{inpath}", "-o{outdir}")
++    EXTRACTOR = WindowsLibarchiveExtractor("iso9660") if sys.platform == "win32" else Command("7z", "x", "-y", "{inpath}", "-o{outdir}")
+ 
+     DOC = HandlerDoc(
+         name="ISO 9660",
+--- a/python/unblob/handlers/filesystem/jffs2.py
++++ b/python/unblob/handlers/filesystem/jffs2.py
+@@ -1,5 +1,8 @@
+ import binascii
+ import io
++import sys
++
++from unblob.windows_jffs2 import WindowsJffs2Extractor
+ 
+ from structlog import get_logger
+ 
+@@ -44,6 +47,10 @@
+ JFFS2_NODETYPES = {DIRENT, INODE, CLEANMARKER, PADDING, SUMMARY, XATTR, XREF}
+ 
+ 
++def mtd_crc(data):
++    return (binascii.crc32(data, -1) ^ -1) & 0xFFFFFFFF
++
++
+ class _JFFS2Base(StructHandler):
+     C_DEFINITIONS = r"""
+         typedef struct jffs2_unknown_node
+@@ -53,13 +60,29 @@
+             uint32 totlen;
+             uint32 hdr_crc;
+         } jffs2_unknown_node_t;
++
++        typedef struct jffs2_raw_dirent {
++            uint16 magic; uint16 nodetype; uint32 totlen; uint32 hdr_crc;
++            uint32 pino; uint32 version; uint32 ino; uint32 mctime;
++            uint8 nsize; uint8 type; uint8 unused[2];
++            uint32 node_crc; uint32 name_crc;
++        } jffs2_raw_dirent_t;
++        typedef struct jffs2_raw_inode {
++            uint16 magic; uint16 nodetype; uint32 totlen; uint32 hdr_crc;
++            uint32 ino; uint32 version; uint32 mode; uint16 uid; uint16 gid;
++            uint32 isize; uint32 atime; uint32 mtime; uint32 ctime;
++            uint32 offset; uint32 csize; uint32 dsize;
++            uint8 compr; uint8 usercompr; uint16 flags;
++            uint32 data_crc; uint32 node_crc;
++        } jffs2_raw_inode_t;
++
+     """
+ 
+     HEADER_STRUCT = "jffs2_unknown_node_t"
+ 
+     BIG_ENDIAN_MAGIC = 0x19_85
+ 
+-    EXTRACTOR = Command("jefferson", "-v", "-f", "-d", "{outdir}", "{inpath}")
++    EXTRACTOR = WindowsJffs2Extractor() if sys.platform == "win32" else Command("jefferson", "-v", "-f", "-d", "{outdir}", "{inpath}")
+ 
+     def guess_endian(self, file: File) -> Endian:
+         magic = convert_int16(file.read(2), Endian.BIG)
+@@ -68,7 +91,7 @@
+         return endian
+ 
+     def valid_header(self, header, node_start_offset: int, eof: int) -> bool:
+-        header_crc = (binascii.crc32(header.dumps()[:-4], -1) ^ -1) & 0xFFFFFFFF
++        header_crc = mtd_crc(header.dumps()[:-4])
+         check_crc = True
+ 
+         if header.nodetype not in JFFS2_NODETYPES:
+--- a/python/unblob/handlers/filesystem/ntfs.py
++++ b/python/unblob/handlers/filesystem/ntfs.py
+@@ -1,3 +1,6 @@
++import sys
++from unblob.windows_sevenzip import WindowsSevenZipExtractor
++
+ from structlog import get_logger
+ 
+ from unblob.file_utils import InvalidInputFormat
+@@ -65,7 +68,7 @@
+ 
+     HEADER_STRUCT = "ntfs_boot_t"
+ 
+-    EXTRACTOR = Command("7z", "x", "-x![SYSTEM]", "-y", "{inpath}", "-o{outdir}")
++    EXTRACTOR = (WindowsSevenZipExtractor("ntfs") if sys.platform == "win32" else Command("7z", "x", "-x![SYSTEM]", "-y", "{inpath}", "-o{outdir}"))
+ 
+     DOC = HandlerDoc(
+         name="NTFS",
+--- a/python/unblob/handlers/filesystem/squashfs.py
++++ b/python/unblob/handlers/filesystem/squashfs.py
+@@ -1,3 +1,6 @@
++import sys
++from unblob.windows_sevenzip import WindowsSevenZipExtractor
++
+ from pathlib import Path
+ 
+ from structlog import get_logger
+@@ -30,6 +33,8 @@
+         self.big_endian_magic = big_endian_magic
+ 
+     def extract(self, inpath: Path, outdir: Path):
++        if sys.platform == "win32":
++            return WindowsSevenZipExtractor("squashfs").extract(inpath, outdir)
+         with File.from_path(inpath) as file:
+             endian = get_endian(file, self.big_endian_magic)
+ 
+@@ -66,7 +71,7 @@
+         extractor.extract(inpath, outdir)
+ 
+     def get_dependencies(self) -> list[str]:
+-        return [self.EXECUTABLE, self.V4BE_EXECUTABLE]
++        return [] if sys.platform == "win32" else [self.EXECUTABLE, self.V4BE_EXECUTABLE]
+ 
+ 
+ class _SquashFSBase(StructHandler):
+--- a/python/unblob/handlers/filesystem/ubi.py
++++ b/python/unblob/handlers/filesystem/ubi.py
+@@ -1,4 +1,8 @@
+ import shutil
++import sys
++
++from unblob.windows_ubi import WindowsUbiExtractor
++from unblob.windows_ubifs import WindowsUbifsExtractor
+ import statistics
+ from pathlib import Path
+ 
+@@ -89,7 +93,7 @@
+     """
+     HEADER_STRUCT = "ubifs_sb_node_t"
+ 
+-    EXTRACTOR = Command("ubireader_extract_files", "{inpath}", "-w", "-o", "{outdir}")
++    EXTRACTOR = WindowsUbifsExtractor() if sys.platform == "win32" else Command("ubireader_extract_files", "{inpath}", "-w", "-o", "{outdir}")
+ 
+     DOC = HandlerDoc(
+         name="UBIFS",
+@@ -142,7 +146,7 @@
+ 
+     PATTERNS = [HexString("55 42 49 23 01  // UBI# and version 1")]
+ 
+-    EXTRACTOR = UBIExtractor("ubireader_extract_images", "{inpath}", "-o", "{outdir}")
++    EXTRACTOR = WindowsUbiExtractor() if sys.platform == "win32" else UBIExtractor("ubireader_extract_images", "{inpath}", "-o", "{outdir}")
+ 
+     DOC = HandlerDoc(
+         name="UBI",
+@@ -163,6 +167,12 @@
+     )
+ 
+     def _guess_peb_size(self, file: File) -> int:
++        if sys.platform == "win32":
++            from ubireader.ubi.readonly import guess_peb_size
++            try:
++                return guess_peb_size(file)
++            except ValueError as error:
++                raise InvalidInputFormat(str(error)) from error
+         # Since we don't know the PEB size, we need to guess it. At the moment we just find the
+         # most common interval between every erase block header we find in the image. This _might_
+         # cause an issue if we had a blob containing multiple UBI images, with different PEB sizes.
+--- a/python/unblob/pool.py
++++ b/python/unblob/pool.py
+@@ -1,7 +1,6 @@
+ import abc
+ import atexit
+ import contextlib
+-import fcntl
+ import multiprocessing as mp
+ import multiprocessing.connection
+ import os
+@@ -15,7 +14,9 @@
+ 
+ from .logging import multiprocessing_breakpoint
+ 
+-mp.set_start_method("fork")
++if sys.platform != "win32":
++    import fcntl
++    mp.set_start_method("fork")
+ 
+ 
+ class PoolBase(abc.ABC):
+@@ -263,6 +264,8 @@
+ 
+ 
+ def make_pool(process_num, handler, result_callback) -> SinglePool | MultiPool:
++    if sys.platform == "win32" and process_num != 1:
++        raise ValueError("Windows extraction requires one parent-isolated worker")
+     if process_num == 1:
+         return SinglePool(handler=handler, result_callback=result_callback)
+ 
+--- a/python/unblob/report.py
++++ b/python/unblob/report.py
+@@ -328,6 +328,12 @@
+ 
+     def log_with(self, logger):
+         logger.warning(self.log_msg, path=self.path, mode=self.mode, device=self.device)
++
++
++class ArchiveDeviceExtractionProblem(ExtractionProblem):
++    mode: int
++    device_major: int
++    device_minor: int
+ 
+ 
+ class ExtendedAttributeExtractionProblem(ExtractionProblem):
+--- a/python/unblob/sandbox.py
++++ b/python/unblob/sandbox.py
+@@ -1,4 +1,5 @@
+ import threading
++import sys
+ from collections.abc import Callable, Iterable
+ from pathlib import Path
+ from typing import ParamSpec, TypeVar
+@@ -37,6 +38,11 @@
+         report_file: Path | None,
+         extra_passthrough: Iterable[AccessFS] = (),
+     ):
++        if sys.platform == "win32":
++            if extra_passthrough:
++                raise SandboxError("Windows passthrough must be established by the native parent")
++            self.passthrough = []
++            return
+         self.passthrough = [
+             # Python, shared libraries, extractor binaries and so on
+             AccessFS.read("/"),
+@@ -64,8 +70,8 @@
+         def _run_in_thread(callback, *args, **kwargs):
+             nonlocal exception, result
+ 
+-            self._try_enter_sandbox()
+             try:
++                self._try_enter_sandbox()
+                 result = callback(*args, **kwargs)
+             except BaseException as e:
+                 exception = e
+@@ -84,6 +90,10 @@
+         return result  # pyright: ignore[reportReturnType]
+ 
+     def _try_enter_sandbox(self):
++        if sys.platform == "win32":
++            from unblob.windows_sandbox import require_native_sandbox
++            require_native_sandbox()
++            return
+         try:
+             restrict_access(*self.passthrough)
+         except SandboxError:
+--- /dev/null
++++ b/python/unblob/windows_archive_paths.py
+@@ -0,0 +1,37 @@
++"""Admit archive coordinates without Win32 aliases or hidden data streams."""
++import ntpath
++from pathlib import Path
++
++
++def checked_windows_archive_path(root: Path, raw: str, *, posix_source=False) -> Path:
++    if posix_source and "\\" in raw:
++        raise ValueError("Archive filename contains a literal backslash that Windows would reinterpret")
++    drive, _ = ntpath.splitdrive(raw)
++    if drive or raw.startswith(("/", "\\")):
++        raise ValueError("Windows extraction cannot preserve an anchored archive path")
++    parts = raw.replace("\\", "/").split("/")
++    for part in parts:
++        if part in ("", ".", ".."):
++            continue
++        if ntpath.isreserved(part):
++            raise ValueError("Archive name uses a reserved Windows name, character or data stream")
++    relative = Path(raw)
++    boundary = root.resolve()
++    target = boundary / relative
++    if not target.resolve().is_relative_to(boundary):
++        raise ValueError("Archive path escapes the extraction directory")
++    current = boundary
++    for part in relative.parts:
++        if part == "..":
++            current = current.parent
++            continue
++        current = current / part
++        if current.exists() or current.is_symlink():
++            # Compare source spelling to the OS-resolved spelling, not a
++            # case-folding approximation of the filesystem's Unicode rules.
++            observed = current.resolve(strict=True)
++            if observed.name != part:
++                raise ValueError("Archive name aliases an existing Windows entry with different spelling")
++            if not observed.is_relative_to(boundary):
++                raise ValueError("Archive entry resolves outside the extraction directory")
++    return relative
+--- /dev/null
++++ b/python/unblob/windows_erofs.py
+@@ -0,0 +1,100 @@
++"""Read EROFS through a fixed handle-only native library in the Windows worker."""
++import ctypes
++from functools import lru_cache
++from pathlib import Path
++import stat
++
++from unblob.models import Extractor, ExtractResult
++from unblob.report import ExtractionProblem, UnknownError
++from unblob.windows_archive_paths import checked_windows_archive_path
++from unblob.windows_stream_extractors import CHUNK_BYTES, MAX_OUTPUT_BYTES
++
++
++@lru_cache(maxsize=1)
++def _library():
++    dll = ctypes.CDLL(str(Path(__file__).parent / "_windows_native/rea-erofs.dll"), winmode=0x100 | 0x800)
++    ptr, u32, u64, integer = ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint64, ctypes.c_int
++    signatures = {
++        "reaer_open": [ptr, ctypes.POINTER(ptr)],
++        "reaer_close": [ptr],
++        "reaer_count": [ptr, ctypes.POINTER(u32), ctypes.POINTER(u32), ctypes.POINTER(integer)],
++        "reaer_item": [ptr, u32, ptr, u32, ctypes.POINTER(u32), ctypes.POINTER(u32),
++                       ctypes.POINTER(u32), ctypes.POINTER(u64), ctypes.POINTER(u32), ctypes.POINTER(integer)],
++        "reaer_read": [ptr, u32, u64, ptr, u32],
++    }
++    for name, arguments in signatures.items():
++        method = getattr(dll, name); method.argtypes = arguments; method.restype = integer
++    return dll
++
++
++def _checked(status, action):
++    if status:
++        raise ValueError(f"Native EROFS {action} failed (errno {abs(status)})")
++
++
++class WindowsErofsExtractor(Extractor):
++    def extract(self, inpath, outdir):
++        import msvcrt
++        reports = []
++
++        def problem(path, error):
++            if len(reports) >= 128:
++                raise ValueError("EROFS diagnostic bound reached; remaining coverage is unknown")
++            reports.append(ExtractionProblem(path=path, problem=str(error),
++                resolution="Verified content retained; no repair, host links, mount or permission changes applied."))
++        try:
++            dll = _library(); session = ctypes.c_void_p()
++            with inpath.open("rb") as source:
++                _checked(dll.reaer_open(msvcrt.get_osfhandle(source.fileno()), ctypes.byref(session)), "open/checksum")
++                try:
++                    count, errors, last_error = ctypes.c_uint32(), ctypes.c_uint32(), ctypes.c_int()
++                    _checked(dll.reaer_count(session, ctypes.byref(count), ctypes.byref(errors), ctypes.byref(last_error)), "inventory")
++                    if not 1 <= count.value <= 10000:
++                        raise ValueError("EROFS native inventory exceeds its declared bound")
++                    if errors.value:
++                        problem("<EROFS directory inventory>", f"{errors.value} directory reads were incomplete (last errno {abs(last_error.value)})")
++                    paths = {0: ()}
++                    buffer = ctypes.create_string_buffer(CHUNK_BYTES)
++                    total = 0
++                    for index in range(1, count.value):
++                        coordinate = f"<EROFS entry index {index}; name unknown>"
++                        try:
++                            name = ctypes.create_string_buffer(256)
++                            length, parent, mode, xattrs = (ctypes.c_uint32() for _ in range(4))
++                            size, status = ctypes.c_uint64(), ctypes.c_int()
++                            _checked(dll.reaer_item(session, index, name, len(name), ctypes.byref(length),
++                                ctypes.byref(parent), ctypes.byref(mode), ctypes.byref(size),
++                                ctypes.byref(xattrs), ctypes.byref(status)), "metadata")
++                            raw = name.raw[:length.value]
++                            coordinate = f"<EROFS entry {index}, parent {parent.value}, name bytes {raw.hex()}>"
++                            component = raw.decode("utf-8", "strict")
++                            if parent.value not in paths or parent.value >= index:
++                                raise ValueError("EROFS parent path was not admitted")
++                            if component in ("", ".", "..") or "/" in component or "\0" in component:
++                                raise ValueError("Invalid EROFS directory component")
++                            parts = (*paths[parent.value], component)
++                            coordinate = "/".join(parts)
++                            target = outdir / checked_windows_archive_path(outdir, coordinate, posix_source=True)
++                            if stat.S_ISDIR(mode.value):
++                                target.mkdir(parents=True, exist_ok=True); paths[index] = parts
++                                continue
++                            if not stat.S_ISREG(mode.value):
++                                raise ValueError("EROFS link or special inode was not materialized")
++                            if size.value > MAX_OUTPUT_BYTES - total:
++                                raise ValueError("EROFS file exceeds the 512 MiB output bound")
++                            target.parent.mkdir(parents=True, exist_ok=True)
++                            with target.open("xb") as output:
++                                offset = 0
++                                while offset < size.value:
++                                    amount = min(CHUNK_BYTES, size.value - offset)
++                                    _checked(dll.reaer_read(session, index, offset, buffer, amount), "content read")
++                                    output.write(buffer.raw[:amount]); offset += amount; total += amount
++                        except (ValueError, OSError, UnicodeError, EOFError) as error:
++                            problem(coordinate, error)
++                finally:
++                    if session.value:
++                        status = dll.reaer_close(session); session.value = None
++                        _checked(status, "close")
++        except Exception as error:
++            reports.append(UnknownError(exception=error))
++        return ExtractResult(reports=reports)
+--- /dev/null
++++ b/python/unblob/windows_flash_codecs.py
+@@ -0,0 +1,87 @@
++"""Bounded flash-node codecs. Corrupt compressed input is never zero-filled."""
++import ctypes
++from functools import lru_cache
++import lzma
++from pathlib import Path
++import zlib
++
++MAX_NODE_BYTES = 128 * 1024 * 1024
++
++
++@lru_cache(maxsize=1)
++def _lzo():
++    # The DLL and its dependencies are part of the sealed engine inventory.
++    dll = ctypes.CDLL(str(Path(__file__).parent / "_windows_native" / "rea-lzo.dll"),
++                      winmode=0x100 | 0x800)
++    decode = dll.rea_lzo_decode
++    decode.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p,
++                       ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
++    decode.restype = ctypes.c_int
++    return dll
++
++
++def decode_flash_node(data, expected, codec):
++    if not 0 <= expected <= MAX_NODE_BYTES or len(data) > MAX_NODE_BYTES:
++        raise ValueError("Flash node exceeds the 128 MiB decoder buffer bound")
++    if codec == "none":
++        output = data
++    elif codec == "zero":
++        if data:
++            raise ValueError("Zero-compressed node contains unexpected encoded bytes")
++        output = bytes(expected)
++    elif codec in ("zlib", "deflate"):
++        decoder = zlib.decompressobj(-11 if codec == "deflate" else 15)
++        output = decoder.decompress(data, expected + 1)
++        if not decoder.eof or decoder.unused_data or decoder.unconsumed_tail:
++            raise ValueError("Zlib node has a truncated, trailing or oversized stream")
++    elif codec == "zstd":
++        from pyzstd import DParameter, ZstdDecompressor
++        decoder = ZstdDecompressor(option={DParameter.windowLogMax: 27})
++        output = decoder.decompress(data, max_length=expected + 1)
++        if not decoder.eof or decoder.unused_data:
++            raise ValueError("Zstd node has a truncated, trailing or oversized stream")
++    elif codec == "lzo":
++        output_buffer = ctypes.create_string_buffer(max(1, expected))
++        written = ctypes.c_size_t()
++        result = _lzo().rea_lzo_decode(data, len(data), output_buffer, expected,
++                                      ctypes.byref(written))
++        if result != 0 or written.value > expected:
++            raise ValueError(f"LZO node decode failed (result {result})")
++        output = output_buffer.raw[:written.value]
++    elif codec == "rtime":
++        output = bytearray(expected)
++        positions = [0] * 256
++        cursor = 0
++        for offset in range(0, len(data), 2):
++            if offset + 1 >= len(data) or cursor >= expected:
++                raise ValueError("RTIME node has a truncated or trailing pair")
++            value, repeat = data[offset:offset + 2]
++            output[cursor] = value
++            cursor += 1
++            back = positions[value]
++            positions[value] = cursor
++            if repeat > expected - cursor or back >= cursor:
++                raise ValueError("RTIME node exceeds its declared output extent")
++            for _ in range(repeat):
++                output[cursor] = output[back]
++                cursor += 1
++                back += 1
++        if cursor != expected:
++            raise ValueError("RTIME node is shorter than its declared output extent")
++    elif codec in ("lzma", "lzma-no-size"):
++        if codec == "lzma":
++            prefix, compressed = b"\0\0\x20\0\0", data
++        else:
++            if len(data) < 5:
++                raise ValueError("Truncated LZMA node properties")
++            prefix, compressed = data[:5], data[5:]
++        decoder = lzma.LZMADecompressor(format=lzma.FORMAT_ALONE, memlimit=MAX_NODE_BYTES)
++        output = decoder.decompress(prefix + expected.to_bytes(8, "little") + compressed,
++                                    max_length=expected + 1)
++        if not decoder.eof or decoder.unused_data:
++            raise ValueError("LZMA node has a truncated, trailing or oversized stream")
++    else:
++        raise ValueError(f"Unknown flash compression: {codec}")
++    if len(output) != expected:
++        raise ValueError("Decoded flash node length disagrees with its declared size")
++    return output
+--- /dev/null
++++ b/python/unblob/windows_hyperscan.py
+@@ -0,0 +1,136 @@
++"""Native Windows binding for the streaming contract used by Unblob 26.6.4.
++
++This adapter uses hyperscan 0.9.1; it is not a pyperscan distribution.
++Offsets, pattern tags, termination and reset follow the pinned producer API.
++"""
++from enum import IntEnum, IntFlag
++
++import hyperscan
++
++
++class Flag(IntFlag):
++    SOM_LEFTMOST = hyperscan.HS_FLAG_SOM_LEFTMOST
++    DOTALL = hyperscan.HS_FLAG_DOTALL
++
++
++class Scan(IntEnum):
++    Continue = 0
++    Terminate = 1
++
++
++class Pattern:
++    def __init__(self, expression: bytes, *flags: Flag, tag=None):
++        if not isinstance(expression, bytes):
++            raise TypeError("Pattern expression must retain its source bytes")
++        if b"\x00" in expression:
++            raise ValueError("Regex source cannot contain a NUL byte; use an escaped byte expression")
++        self.expression = expression
++        self.flags = 0
++        for flag in flags:
++            self.flags |= int(flag)
++        self.tag = tag
++
++
++class StreamDatabase:
++    def __init__(self, *patterns: Pattern):
++        if not patterns:
++            raise ValueError("A stream database requires patterns")
++        self.tags = tuple(index if p.tag is None else p.tag for index, p in enumerate(patterns))
++        self.database = hyperscan.Database(
++            mode=hyperscan.HS_MODE_STREAM | hyperscan.HS_MODE_SOM_HORIZON_LARGE
++        )
++        self.database.compile(
++            expressions=[p.expression for p in patterns],
++            ids=list(range(len(patterns))),
++            flags=[p.flags for p in patterns],
++        )
++
++    def build(self, context, on_match):
++        return StreamScanner(self, context, on_match)
++
++
++def _discard_match(*_args):
++    return False
++
++
++class StreamScanner:
++    def __init__(self, owner, context, on_match):
++        self.owner = owner
++        self.context = context
++        self.on_match = on_match
++        self.scratch = hyperscan.Scratch(owner.database)
++        self.stream = None
++        self._callback_error = None
++        self._terminated = False
++        # Keep one callback identity across resets. The fixed native stream
++        # owns its references and participates in cyclic garbage collection.
++        self._callback = self._match
++        self._open()
++
++    def _open(self):
++        self.stream = self.owner.database.stream(
++            match_event_handler=self._callback, context=self.context
++        )
++        self.stream.__enter__()
++
++    def _match(self, expression_id, start, end, _flags, _context):
++        try:
++            result = self.on_match(self.context, self.owner.tags[expression_id], start, end)
++            if not isinstance(result, Scan):
++                raise TypeError("Match callback must return Scan")
++            self._terminated = result is Scan.Terminate
++        except BaseException as error:
++            self._callback_error = error
++            self._terminated = True
++        return self._terminated
++
++    def _call(self, operation):
++        self._callback_error = None
++        try:
++            operation()
++        except hyperscan.ScanTerminated:
++            if not self._terminated and self._callback_error is None:
++                raise
++        if self._callback_error is not None:
++            error, self._callback_error = self._callback_error, None
++            raise error
++        return Scan.Terminate if self._terminated else Scan.Continue
++
++    def scan(self, data, chunk_size=None):
++        if self.stream is None:
++            raise RuntimeError("Cannot scan a closed stream")
++        if self._terminated:
++            return Scan.Terminate
++        if chunk_size is not None and (not isinstance(chunk_size, int) or chunk_size <= 0):
++            raise ValueError("chunk_size must be a positive integer")
++        with memoryview(data) as view:
++            size = chunk_size or len(view) or 1
++            for start in range(0, len(view), size):
++                with view[start : start + size] as part:
++                    result = self._call(lambda: self.stream.scan(part, scratch=self.scratch))
++                if result is Scan.Terminate:
++                    return result
++        return Scan.Continue
++
++    def reset(self):
++        if self.stream is None:
++            raise RuntimeError("Cannot reset a closed stream")
++        stream, self.stream = self.stream, None
++        self._terminated = False
++        try:
++            result = self._call(lambda: stream.close(scratch=self.scratch))
++        finally:
++            self._terminated = False
++            self._open()
++        return result
++
++    def close(self):
++        if self.stream is not None:
++            stream, self.stream = self.stream, None
++            # Producer destruction discards end-of-stream matches; reset() above
++            # instead preserves its callback semantics.
++            stream.close(scratch=self.scratch, match_event_handler=_discard_match)
++
++    def __del__(self):
++        if hasattr(self, "stream"):
++            self.close()
+--- /dev/null
++++ b/python/unblob/windows_jffs2.py
+@@ -0,0 +1,234 @@
++"""Read-only JFFS2 recovery using the handler-owned structures and CRC rules."""
++from bisect import bisect_left, bisect_right
++from collections import defaultdict, deque
++from dataclasses import dataclass
++import stat
++
++from unblob.models import Extractor, ExtractResult
++from unblob.file_utils import read_until_past
++from unblob.report import ExtractionProblem, UnknownError
++from unblob.windows_archive_paths import checked_windows_archive_path
++from unblob.windows_flash_codecs import decode_flash_node
++from unblob.windows_stream_extractors import MAX_OUTPUT_BYTES
++
++MAX_NODES = 100_000
++MAX_ENTRIES = 10_000
++CODECS = {0: "none", 1: "zero", 2: "rtime", 4: "none", 6: "zlib",
++          7: "lzo", 8: "lzma", 0x15: "lzma-no-size"}
++
++
++@dataclass
++class Inode:
++    header: object
++    source_offset: int
++    encoded: bytes
++
++
++def _fragments(nodes):
++    """Replay admitted versions, retaining source ownership for every byte."""
++    segments = []
++    for node in nodes:
++        inode = node.header
++        # A later inode version can truncate the preceding file state.
++        end = bisect_left(segments, inode.isize, key=lambda item: item[0])
++        del segments[end:]
++        if segments and segments[-1][1] > inode.isize:
++            start, _, old = segments[-1]
++            segments[-1] = (start, inode.isize, old)
++        if inode.dsize == 0:
++            continue
++        start, stop = inode.offset, inode.offset + inode.dsize
++        first = max(0, bisect_right(segments, start, key=lambda item: item[0]) - 1)
++        if first < len(segments) and segments[first][1] <= start:
++            first += 1
++        last = bisect_left(segments, stop, key=lambda item: item[0])
++        replacement = []
++        if first < len(segments) and segments[first][0] < start:
++            a, _, old = segments[first]
++            replacement.append((a, start, old))
++        replacement.append((start, stop, node))
++        if last and last > first and segments[last - 1][1] > stop:
++            _, b, old = segments[last - 1]
++            replacement.append((stop, b, old))
++        segments[first:last] = replacement
++    cursor = 0
++    for start, stop, _ in segments:
++        if start != cursor:
++            raise ValueError("JFFS2 content has an unproven gap; no zero-fill repair was applied")
++        cursor = stop
++    if cursor != nodes[-1].header.isize:
++        raise ValueError("JFFS2 content is incomplete; no zero-fill repair was applied")
++    return segments
++
++
++class WindowsJffs2Extractor(Extractor):
++    def extract(self, inpath, outdir):
++        # The format handler owns endianness, node layouts and CRC semantics.
++        from unblob.handlers.filesystem.jffs2 import (
++            JFFS2NewHandler, JFFS2OldHandler, JFFS2_NODE_ACCURATE,
++            DIRENT, INODE, CLEANMARKER, PADDING, SUMMARY, XATTR, XREF, mtd_crc,
++        )
++        reports = []
++
++        def problem(coordinate, reason):
++            if len(reports) >= 128:
++                raise ValueError("JFFS2 diagnostic limit reached; remaining coverage is unknown")
++            reports.append(ExtractionProblem(path=coordinate, problem=str(reason),
++                resolution="Uncertain content was not repaired; verified output and original input retained."))
++
++        try:
++            inodes = defaultdict(dict)
++            dirents = {}
++            tainted = set()
++            identity_unknown = False
++            with inpath.open("rb") as source:
++                magic = source.read(2)
++                handler = JFFS2OldHandler() if magic in (b"\x84\x19", b"\x19\x84") else JFFS2NewHandler()
++                source.seek(0)
++                endian = handler.guess_endian(source)
++                parser = handler.cparser_be if endian.value == ">" else handler.cparser_le
++                size = inpath.stat().st_size
++                offset = count = 0
++                while offset < size:
++                    if count >= MAX_NODES:
++                        raise ValueError("JFFS2 node inventory exceeds its 100000-node bound")
++                    source.seek(offset)
++                    raw_header = source.read(12)
++                    if raw_header[:4] in (b"\0" * 4, b"\xff" * 4):
++                        source.seek(offset)
++                        offset = read_until_past(source, b"\0\xff")
++                        if offset < size and offset % 4:
++                            raise ValueError("Unaligned JFFS2 node follows padding")
++                        continue
++                    if len(raw_header) != 12:
++                        raise EOFError("Truncated JFFS2 node header")
++                    header = handler.parse_header(raw_header, endian=endian)
++                    if header.magic not in (0x1984, 0x1985) or not 12 <= header.totlen <= size - offset:
++                        raise ValueError(f"Invalid JFFS2 node extent at input offset {offset}")
++                    normalized = bytearray(raw_header)
++                    # Obsolescence clears one bit without rewriting the stored header CRC.
++                    byteorder = "big" if endian.value == ">" else "little"
++                    normalized[2:4] = (header.nodetype | JFFS2_NODE_ACCURATE).to_bytes(2, byteorder)
++                    if mtd_crc(normalized[:8]) != header.hdr_crc:
++                        raise ValueError(f"JFFS2 header CRC mismatch at input offset {offset}")
++                    count += 1
++                    next_offset = offset + ((header.totlen + 3) & ~3)
++                    if not header.nodetype & JFFS2_NODE_ACCURATE:
++                        offset = next_offset
++                        continue
++                    raw = raw_header + source.read(header.totlen - 12)
++                    coordinate = f"<JFFS2 node at input offset {offset}>"
++                    inode_identity_verified = False
++                    try:
++                        if header.nodetype == INODE:
++                            inode = parser.jffs2_raw_inode_t(raw)
++                            if mtd_crc(raw[:60]) != inode.node_crc:
++                                raise ValueError("JFFS2 inode CRC mismatch; identity remains unknown")
++                            inode_identity_verified = True
++                            if inode.csize != len(raw) - 68 or inode.offset + inode.dsize > inode.isize:
++                                tainted.add(inode.ino)
++                                raise ValueError("JFFS2 inode data extent disagrees with its metadata")
++                            if inode.isize > MAX_OUTPUT_BYTES:
++                                tainted.add(inode.ino)
++                                raise ValueError("JFFS2 inode exceeds the 512 MiB output bound")
++                            if mtd_crc(raw[68:]) != inode.data_crc:
++                                tainted.add(inode.ino)
++                                raise ValueError("JFFS2 data CRC mismatch")
++                            node = Inode(inode, offset, raw[68:])
++                            prior = inodes[inode.ino].get(inode.version)
++                            if prior and (prior.header.dumps() != inode.dumps() or prior.encoded != node.encoded):
++                                tainted.add(inode.ino)
++                                raise ValueError("Conflicting JFFS2 records share an inode version")
++                            inodes[inode.ino][inode.version] = node
++                        elif header.nodetype == DIRENT:
++                            entry = parser.jffs2_raw_dirent_t(raw)
++                            name = raw[40:]
++                            if (entry.nsize != len(name) or mtd_crc(raw[:32]) != entry.node_crc
++                                    or mtd_crc(name) != entry.name_crc):
++                                raise ValueError("JFFS2 directory CRC or name length mismatch")
++                            key = (entry.pino, name)
++                            prior = dirents.get(key)
++                            if prior and prior.version == entry.version and prior.dumps() != entry.dumps():
++                                raise ValueError("Conflicting JFFS2 directory records share a version")
++                            if prior is None or prior.version < entry.version:
++                                dirents[key] = entry
++                        elif header.nodetype in (XATTR, XREF):
++                            problem(coordinate, "JFFS2 extended metadata is retained in the input, not applied to Windows")
++                        elif header.nodetype not in (CLEANMARKER, PADDING, SUMMARY):
++                            raise ValueError(f"Unknown JFFS2 node type 0x{header.nodetype:x}")
++                    except (ValueError, EOFError) as error:
++                        # An unverified identity could be a later update or
++                        # unlink of any earlier record. Do not silently fall
++                        # back to old file state when its owner is unknown.
++                        if header.nodetype == DIRENT or (header.nodetype == INODE and not inode_identity_verified):
++                            identity_unknown = True
++                        problem(coordinate, error)
++                    offset = next_offset
++
++            if identity_unknown:
++                raise ValueError("JFFS2 current namespace is unknown after invalid identity metadata; earlier versions were not substituted")
++            children = defaultdict(list)
++            for (parent, name), entry in dirents.items():
++                if entry.ino:  # ino == 0 is a versioned unlink, not a missing inode.
++                    children[parent].append((name, entry))
++            pending = deque([(1, ())])
++            visited_dirs = set()
++            visited_entries = set()
++            total = decoded = entry_count = 0
++            while pending:
++                parent, parts = pending.popleft()
++                if parent in visited_dirs or len(parts) > 128:
++                    problem("/".join(parts), "JFFS2 directory cycle, alias or depth bound")
++                    continue
++                visited_dirs.add(parent)
++                for raw_name, entry in children[parent]:
++                    entry_count += 1
++                    if entry_count > MAX_ENTRIES:
++                        raise ValueError("JFFS2 directory inventory exceeds its 10000-entry bound")
++                    visited_entries.add((parent, raw_name))
++                    coordinate = f"<JFFS2 parent {parent}, name bytes {raw_name.hex()}>"
++                    try:
++                        name = raw_name.decode("utf-8", "strict")
++                        if name in ("", ".", "..") or "/" in name or "\0" in name:
++                            raise ValueError("Invalid JFFS2 directory component")
++                        coordinate = "/".join((*parts, name))
++                        target = outdir / checked_windows_archive_path(outdir, coordinate, posix_source=True)
++                        if entry.ino in tainted:
++                            raise ValueError("JFFS2 inode has invalid source data; its content remains unknown")
++                        nodes = sorted(inodes[entry.ino].values(), key=lambda node: node.header.version)
++                        if not nodes:
++                            raise ValueError("JFFS2 directory entry has no verified inode")
++                        latest = nodes[-1].header
++                        kind = stat.S_IFMT(latest.mode)
++                        if kind == stat.S_IFDIR and entry.type == 4:
++                            target.mkdir(parents=True, exist_ok=True)
++                            pending.append((entry.ino, (*parts, name)))
++                            continue
++                        if kind != stat.S_IFREG or entry.type != 8:
++                            raise ValueError("JFFS2 link, special file or inconsistent type was not materialized")
++                        if latest.isize > MAX_OUTPUT_BYTES - total:
++                            raise ValueError("JFFS2 extraction exceeds the 512 MiB output bound")
++                        fragments = _fragments(nodes)
++                        target.parent.mkdir(parents=True, exist_ok=True)
++                        with target.open("xb") as output:
++                            previous = expanded = None
++                            for start, stop, node in fragments:
++                                if node is not previous:
++                                    if node.header.dsize > MAX_OUTPUT_BYTES - decoded:
++                                        raise ValueError("JFFS2 cumulative decoding exceeds its 512 MiB work bound")
++                                    decoded += node.header.dsize
++                                    expanded = decode_flash_node(node.encoded, node.header.dsize,
++                                        CODECS.get(node.header.compr, f"jffs2-0x{node.header.compr:x}"))
++                                    previous = node
++                                data = memoryview(expanded)[start - node.header.offset:stop - node.header.offset]
++                                output.write(data)
++                                total += len(data)
++                    except (ValueError, OSError, UnicodeError, EOFError) as error:
++                        problem(coordinate, error)
++            omitted = sum(1 for entries in children.values() for name, entry in entries
++                          if (entry.pino, name) not in visited_entries)
++            if omitted:
++                problem("<JFFS2 directory inventory>", f"{omitted} entries have unreachable or unverified parents")
++        except Exception as error:
++            reports.append(UnknownError(exception=error))
++        return ExtractResult(reports=reports)
+--- /dev/null
++++ b/python/unblob/windows_libarchive.py
+@@ -0,0 +1,177 @@
++"""Read native archive formats inside REA's single AppContainer worker.
++
++The library only decodes entries. This owner validates every output path and
++writes regular files itself; libarchive's filesystem extraction API is unused.
++"""
++import ctypes
++from functools import lru_cache
++from pathlib import Path
++import stat
++
++from unblob.models import Extractor, ExtractResult, DirectoryExtractor
++from unblob.report import ExtractionProblem, UnknownError
++from unblob.windows_archive_paths import checked_windows_archive_path
++from unblob.windows_stream_extractors import CHUNK_BYTES, MAX_OUTPUT_BYTES
++
++MAX_ENTRIES = 10000
++
++
++@lru_cache(maxsize=1)
++def _library():
++    path = Path(__file__).parent / "_windows_native" / "libarchive-13.dll"
++    # Only this admitted directory and Windows system DLLs may resolve imports.
++    lib = ctypes.CDLL(str(path), winmode=0x100 | 0x800)
++    pointer = ctypes.c_void_p
++    signatures = {
++        "archive_read_new": (pointer, []),
++        "archive_read_support_filter_none": (ctypes.c_int, [pointer]),
++        "archive_read_open_filename_w": (ctypes.c_int, [pointer, ctypes.c_wchar_p, ctypes.c_size_t]),
++        "archive_read_open_memory": (ctypes.c_int, [pointer, pointer, ctypes.c_size_t]),
++        "archive_read_next_header": (ctypes.c_int, [pointer, ctypes.POINTER(pointer)]),
++        "archive_read_data": (ctypes.c_ssize_t, [pointer, pointer, ctypes.c_size_t]),
++        "archive_read_data_skip": (ctypes.c_int, [pointer]),
++        "archive_read_free": (ctypes.c_int, [pointer]),
++        "archive_error_string": (ctypes.c_char_p, [pointer]),
++        "archive_entry_pathname_utf8": (ctypes.c_char_p, [pointer]),
++        "archive_entry_filetype": (ctypes.c_uint, [pointer]),
++        "archive_entry_size": (ctypes.c_int64, [pointer]),
++        "archive_entry_size_is_set": (ctypes.c_int, [pointer]),
++        "archive_entry_symlink": (pointer, [pointer]),
++        "archive_entry_hardlink": (pointer, [pointer]),
++        "archive_entry_is_encrypted": (ctypes.c_int, [pointer]),
++    }
++    for kind in ("7zip", "cab", "rar", "rar5", "iso9660"):
++        signatures["archive_read_support_format_" + kind] = (ctypes.c_int, [pointer])
++    for name, (result, args) in signatures.items():
++        function = getattr(lib, name)
++        function.restype = result
++        function.argtypes = args
++    return lib
++
++
++class WindowsLibarchiveExtractor(Extractor):
++    def __init__(self, kind):
++        if kind not in ("7zip", "cab", "rar", "iso9660"):
++            raise ValueError("Unsupported fixed Windows archive adapter")
++        self.kind = kind
++
++    def extract(self, inpath, outdir):
++        return self._extract(inpath, outdir)
++
++    def _extract(self, inpath, outdir, joined=None):
++        lib = _library()
++        archive = lib.archive_read_new()
++        if not archive:
++            raise MemoryError("Unable to allocate native archive reader")
++        reports = []
++        total = 0
++
++        def checked(status):
++            if status < 0:
++                reason = lib.archive_error_string(archive)
++                raise ValueError("Native archive decoding failed: " +
++                    (reason.decode("utf-8", "backslashreplace") if reason else str(status)))
++
++        try:
++            checked(lib.archive_read_support_filter_none(archive))
++            for kind in (("rar", "rar5") if self.kind == "rar" else (self.kind,)):
++                checked(getattr(lib, "archive_read_support_format_" + kind)(archive))
++            if joined is None:
++                checked(lib.archive_read_open_filename_w(archive, str(inpath), CHUNK_BYTES))
++            else:
++                # The directory owner selects and orders parts. Keep the single
++                # bounded allocation alive for the entire native reader lifetime.
++                backing = (ctypes.c_char * len(joined)).from_buffer(joined)
++                checked(lib.archive_read_open_memory(archive, backing, len(joined)))
++            buffer = ctypes.create_string_buffer(CHUNK_BYTES)
++            entry = ctypes.c_void_p()
++            count = 0
++            while True:
++                status = lib.archive_read_next_header(archive, ctypes.byref(entry))
++                if status == 1:  # ARCHIVE_EOF
++                    break
++                checked(status)
++                count += 1
++                if count > MAX_ENTRIES:
++                    raise ValueError("Native archive exceeds the 10000 entry resource bound")
++                name_bytes = lib.archive_entry_pathname_utf8(entry)
++                if name_bytes is None:
++                    raise ValueError("Native archive has no lossless UTF-8 entry coordinate")
++                original_name = name_bytes.decode("utf-8", "strict")
++                try:
++                    relative = checked_windows_archive_path(
++                        outdir, original_name, posix_source=self.kind != "cab"
++                    )
++                    target = outdir / relative
++                    file_type = lib.archive_entry_filetype(entry)
++                    if (lib.archive_entry_symlink(entry) or lib.archive_entry_hardlink(entry)
++                            or file_type not in (stat.S_IFREG, stat.S_IFDIR)):
++                        raise ValueError("Entry is a link or special file; its metadata cannot be materialized as a Windows regular file")
++                    if lib.archive_entry_is_encrypted(entry):
++                        raise ValueError("Encrypted entry requires an explicitly supplied credential; none was supplied")
++                    if file_type == stat.S_IFDIR:
++                        target.mkdir(parents=True, exist_ok=True)
++                        checked(lib.archive_read_data_skip(archive))
++                        continue
++                    size = lib.archive_entry_size(entry) if lib.archive_entry_size_is_set(entry) else None
++                    if size is not None and (size < 0 or size > MAX_OUTPUT_BYTES - total):
++                        raise ValueError("Entry exceeds the remaining 512 MiB output bound")
++                    target.parent.mkdir(parents=True, exist_ok=True)
++                    written = 0
++                    with target.open("xb") as output:
++                        while True:
++                            amount = lib.archive_read_data(archive, buffer, CHUNK_BYTES)
++                            checked(amount)
++                            if amount == 0:
++                                break
++                            if amount > MAX_OUTPUT_BYTES - total or (size is not None and amount > size - written):
++                                raise ValueError("Native archive expansion exceeds its admitted size")
++                            output.write(buffer.raw[:amount])
++                            total += amount
++                            written += amount
++                    if size is not None and written != size:
++                        raise EOFError("Native archive entry ended before its declared size")
++                except (ValueError, FileExistsError) as error:
++                    reports.append(ExtractionProblem(
++                        path=original_name, problem=str(error),
++                        resolution="Skipped or partial; prior output and decoded source coordinate retained.",
++                    ))
++                    checked(lib.archive_read_data_skip(archive))
++        except Exception as error:
++            reports.append(UnknownError(exception=error))
++        finally:
++            if lib.archive_read_free(archive) < 0:
++                reports.append(ExtractionProblem(
++                    path=str(inpath), problem="Native archive reader reported an error during close.",
++                    resolution="Known output retained; extraction remains partial.",
++                ))
++        return ExtractResult(reports=reports)
++
++
++class WindowsMultiSevenZipExtractor(DirectoryExtractor):
++    def extract(self, paths, outdir):
++        try:
++            if not 1 <= len(paths) <= MAX_ENTRIES:
++                raise ValueError("7z volume count exceeds the 10000-entry input bound")
++            sizes = [path.stat().st_size for path in paths]
++            total = sum(sizes)
++            if total <= 0 or total > 128 * 1024 * 1024:
++                raise ValueError("7z joined stream exceeds the 128 MiB input bound")
++            joined = bytearray(total)
++            view = memoryview(joined)
++            offset = 0
++            for path, size in zip(paths, sizes):
++                if path.is_symlink() or not path.is_file():
++                    raise ValueError("7z volume is not a regular admitted file")
++                with path.open('rb') as source:
++                    end = offset + size
++                    while offset < end:
++                        amount = source.readinto(view[offset:min(end,offset+CHUNK_BYTES)])
++                        if not amount:
++                            raise EOFError("7z volume ended before its selected extent")
++                        offset += amount
++                    if source.read(1):
++                        raise ValueError("7z volume grew after its extent was selected")
++            return WindowsLibarchiveExtractor('7zip')._extract(paths[0], outdir, joined)
++        except Exception as error:
++            return ExtractResult(reports=[UnknownError(exception=error)])
+--- /dev/null
++++ b/python/unblob/windows_partclone.py
+@@ -0,0 +1,109 @@
++"""Restore admitted Partclone v2 blocks to a regular file, never a device."""
++import binascii
++import hashlib
++import json
++
++from unblob.models import Extractor, ExtractResult
++from unblob.report import UnknownError
++from unblob.windows_stream_extractors import CHUNK_BYTES, MAX_OUTPUT_BYTES
++
++
++class WindowsPartcloneExtractor(Extractor):
++    def extract(self, inpath, outdir):
++        from unblob.handlers.archive.partclone import PartcloneHandler, partclone_image_layout
++        reports = []
++        try:
++            with inpath.open("rb") as source:
++                header = PartcloneHandler().read_image_header(source, 0)
++                layout = partclone_image_layout(header)
++                # BM_BIT is a native-word bitmap in the producer. Do not guess
++                # the byte ordering of an image made by a different architecture.
++                if header.endian != b"\xde\xc0":
++                    raise ValueError("Partclone big-endian bitmap layout is not established")
++                if header.bitmap_mode not in (0, 1):
++                    raise ValueError("Partclone byte bitmap trailer semantics are not established for v2")
++                if header.checksum_mode not in (0, 0x20):
++                    raise ValueError("Partclone checksum algorithm is not admitted by this reader")
++                block_size, blocks = header.fs_block_size, header.fs_total_block_count
++                if (header.fs_size > MAX_OUTPUT_BYTES - 4096 or block_size > 4 * 1024 * 1024
++                        or blocks > 8 * 1024 * 1024):
++                    raise ValueError("Partclone expansion exceeds the 512 MiB output or bounded bitmap limit")
++                if inpath.stat().st_size != layout['image_bytes']:
++                    raise ValueError("Partclone input length disagrees with its complete extent")
++
++                def read_exact(amount):
++                    data = source.read(amount)
++                    if len(data) != amount:
++                        raise EOFError("Truncated Partclone data; missing bytes were not synthesized")
++                    return data
++
++                bitmap = read_exact(layout['bitmap_bytes'])
++                if header.bitmap_mode == 1:
++                    expected = int.from_bytes(read_exact(4), 'little')
++                    if binascii.crc32(bitmap) ^ 0xFFFFFFFF != expected:
++                        raise ValueError("Partclone bitmap CRC32 mismatch")
++                    used = sum(value.bit_count() for value in bitmap)
++                    # Some producers set the unused final bits. They are outside
++                    # the filesystem and never contribute to the used count.
++                    if blocks % 8:
++                        used -= (bitmap[-1] >> (blocks % 8)).bit_count()
++                else:
++                    used = blocks
++                if used != header.fs_used_block_count_bitmap:
++                    raise ValueError("Partclone used-block count disagrees with the verified bitmap")
++                data_offset = source.tell()
++                # Validate the entire selected data stream before exposing a
++                # restored image. Validation is streaming, even for huge groups.
++                crc, in_group = 0, 0
++                for index in range(used):
++                    remaining = block_size
++                    while remaining:
++                        data = read_exact(min(CHUNK_BYTES, remaining))
++                        crc = binascii.crc32(data, crc); remaining -= len(data)
++                    in_group += 1
++                    if header.checksum_mode and (in_group == header.blocks_per_checksum or index + 1 == used):
++                        expected = int.from_bytes(read_exact(4), 'little')
++                        if crc ^ 0xFFFFFFFF != expected:
++                            raise ValueError(f"Partclone data CRC32 mismatch after used block {index + 1}")
++                        in_group = 0
++                        if header.reseed_checksum:
++                            crc = 0
++                if source.tell() != layout['image_bytes']:
++                    raise ValueError("Partclone stream has an unexplained trailing extent")
++                source.seek(data_offset)
++                image = outdir / 'partclone.restored'
++                ordinal = 0
++                with image.open('xb') as output:
++                    for index in range(blocks):
++                        present = not bitmap or bitmap[index // 8] & (1 << (index % 8))
++                        if not present:
++                            continue
++                        output.seek(index * block_size)
++                        remaining = block_size
++                        while remaining:
++                            data = read_exact(min(CHUNK_BYTES, remaining))
++                            available = max(0, header.fs_size - output.tell())
++                            output.write(data[:available]); remaining -= len(data)
++                        ordinal += 1
++                        if header.checksum_mode and (ordinal % header.blocks_per_checksum == 0 or ordinal == used):
++                            read_exact(4)
++                    output.truncate(header.fs_size)
++                # Free source blocks were omitted by Partclone. A zero-filled
++                # output hole is a representation, not recovered original bytes.
++                mapping = {
++                    'schemaVersion': 1, 'format': 'partclone-v2',
++                    'source_filesystem_bytes': header.fs_type.hex(),
++                    'source_bytes': layout['image_bytes'], 'output': image.name,
++                    'output_bytes': header.fs_size, 'block_bytes': block_size,
++                    'total_blocks': blocks, 'copied_blocks': used,
++                    'bitmap_mode': header.bitmap_mode,
++                    'bitmap_sha256': hashlib.sha256(bitmap).hexdigest(),
++                    'checksum_mode': header.checksum_mode,
++                    'unallocated_source_content': 'unknown; not stored in this image',
++                    'unallocated_output_representation': 'zero-filled file holes',
++                    'metadata_changes': 'none; no filesystem fixups or host permissions applied',
++                }
++                (outdir/'partclone-map.json').write_text(json.dumps(mapping,indent=2),encoding='utf-8')
++        except Exception as error:
++            reports.append(UnknownError(exception=error))
++        return ExtractResult(reports=reports)
+--- /dev/null
++++ b/python/unblob/windows_sandbox.py
+@@ -0,0 +1,42 @@
++"""Require the native parent-established boundary; never fall back unsandboxed."""
++import ctypes
++from ctypes import wintypes
++
++
++def require_native_sandbox():
++    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
++    security = ctypes.WinDLL("advapi32", use_last_error=True)
++    kernel.GetCurrentProcess.restype = wintypes.HANDLE
++    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
++    security.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
++    security.GetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
++    kernel.GetProcessMitigationPolicy.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t]
++    kernel.IsProcessInJob.argtypes = [wintypes.HANDLE, wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL)]
++    process = kernel.GetCurrentProcess()
++    token = wintypes.HANDLE()
++    if not security.OpenProcessToken(process, 0x0008, ctypes.byref(token)):
++        raise ctypes.WinError(ctypes.get_last_error())
++    try:
++        container, size = wintypes.DWORD(), wintypes.DWORD()
++        if not security.GetTokenInformation(token, 29, ctypes.byref(container), ctypes.sizeof(container), ctypes.byref(size)):
++            raise ctypes.WinError(ctypes.get_last_error())
++        if container.value != 1:
++            raise PermissionError("Windows extraction requires the native AppContainer launcher")
++        security.GetTokenInformation(token, 30, None, 0, ctypes.byref(size))
++        if ctypes.get_last_error() != 122 or size.value < ctypes.sizeof(wintypes.DWORD):
++            raise PermissionError("Cannot verify the AppContainer capability list")
++        capabilities = ctypes.create_string_buffer(size.value)
++        if not security.GetTokenInformation(token, 30, capabilities, size, ctypes.byref(size)):
++            raise ctypes.WinError(ctypes.get_last_error())
++        if wintypes.DWORD.from_buffer(capabilities).value != 0:
++            raise PermissionError("The extraction worker must have zero capabilities")
++        policy = wintypes.DWORD()
++        if not kernel.GetProcessMitigationPolicy(process, 13, ctypes.byref(policy), ctypes.sizeof(policy)):
++            raise ctypes.WinError(ctypes.get_last_error())
++        if policy.value & 1 != 1:
++            raise PermissionError("Unbrokered child processes must be prohibited")
++        in_job = wintypes.BOOL()
++        if not kernel.IsProcessInJob(process, None, ctypes.byref(in_job)) or not in_job.value:
++            raise PermissionError("The extraction worker must be bound to a native Job Object")
++    finally:
++        kernel.CloseHandle(token)
+--- /dev/null
++++ b/python/unblob/windows_sevenzip.py
+@@ -0,0 +1,165 @@
++"""Fixed-format Windows decoder; Python owns names and writable file handles."""
++import ctypes
++from functools import lru_cache
++import hashlib
++import json
++from pathlib import Path
++from uuid import uuid4
++
++from unblob.models import Extractor, ExtractResult
++from unblob.report import ExtractionProblem, UnknownError
++from unblob.windows_archive_paths import checked_windows_archive_path
++from unblob.windows_stream_extractors import MAX_OUTPUT_BYTES
++
++FORMATS = {"arj": "Arj", "cramfs": "CramFS", "dmg": "Dmg", "extfs": "Ext",
++           "fat": "FAT", "ntfs": "NTFS", "msi": "Compound", "squashfs": "SquashFS"}
++RESULTS = {0: "OK", 1: "unsupported method", 2: "data error", 3: "CRC error",
++           4: "unavailable", 5: "unexpected end", 6: "data after end", 7: "not an archive",
++           8: "headers error", 9: "wrong password", -1: "decoder did not confirm completion"}
++
++
++@lru_cache(maxsize=1)
++def _library():
++    directory = Path(__file__).parent / "_windows_native"
++    engine = ctypes.WinDLL(str(directory / "7z.dll"), winmode=0x100 | 0x800)
++    bridge = ctypes.CDLL(str(directory / "rea-sevenzip.dll"), winmode=0x100 | 0x800)
++    pointer, u32, u64, i32 = ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint64, ctypes.c_int32
++    p32, p64 = ctypes.POINTER(u32), ctypes.POINTER(u64)
++    signatures = {
++        "rea7_abi": (u32, []),
++        "rea7_open": (i32, [pointer, pointer, ctypes.c_wchar_p, ctypes.POINTER(pointer)]),
++        "rea7_count": (i32, [pointer, p32, p32, p32]),
++        "rea7_item": (i32, [pointer, u32, pointer, u32, p32, p32, p64, p32]),
++        "rea7_extract": (i32, [pointer, u32, pointer, u64, p64, ctypes.POINTER(i32), p32]),
++        "rea7_close": (i32, [pointer]),
++    }
++    for name, (result, args) in signatures.items():
++        function = getattr(bridge, name); function.restype = result; function.argtypes = args
++    if bridge.rea7_abi() != 1:
++        raise RuntimeError("Windows archive bridge ABI disagrees with the admitted runtime")
++    return engine, bridge
++
++
++def _checked(status, operation):
++    if status != 0:
++        raise ValueError(f"Windows archive {operation} failed (HRESULT 0x{status & 0xffffffff:08x})")
++
++
++class WindowsSevenZipExtractor(Extractor):
++    def __init__(self, kind):
++        if kind not in FORMATS:
++            raise ValueError("Unsupported fixed Windows archive adapter")
++        self.kind = kind
++
++    def extract(self, inpath, outdir):
++        import msvcrt
++        reports = []
++        session = ctypes.c_void_p()
++        total = 0
++        stream_directory = None
++        stream_records = []
++        stream_metadata_bytes = 0
++        metadata_bound = 4 * 1024 * 1024
++        data_bound = MAX_OUTPUT_BYTES - (metadata_bound if self.kind == "ntfs" else 0)
++        try:
++            engine, bridge = _library()
++            with inpath.open("rb") as source:
++                try:
++                    _checked(bridge.rea7_open(engine._handle, msvcrt.get_osfhandle(source.fileno()),
++                                             FORMATS[self.kind], ctypes.byref(session)), "open")
++                    count, errors, warnings = ctypes.c_uint32(), ctypes.c_uint32(), ctypes.c_uint32()
++                    _checked(bridge.rea7_count(session, ctypes.byref(count), ctypes.byref(errors),
++                                              ctypes.byref(warnings)), "inventory")
++                    if errors.value or warnings.value:
++                        reports.append(ExtractionProblem(
++                            path=str(inpath), problem=f"Decoder archive flags: errors=0x{errors.value:x}, warnings=0x{warnings.value:x}",
++                            resolution="Known output retained; archive-level coverage remains partial."))
++                    for index in range(count.value):
++                        # The marker identifies an unreadable index, never an invented filename.
++                        original_name = f"<archive item index {index}; name unknown>"
++                        stream_record = None
++                        target = None
++                        try:
++                            name = ctypes.create_unicode_buffer(32768)
++                            length, flags, known = ctypes.c_uint32(), ctypes.c_uint32(), ctypes.c_uint32()
++                            size = ctypes.c_uint64()
++                            _checked(bridge.rea7_item(session, index, name, len(name), ctypes.byref(length),
++                                                     ctypes.byref(flags), ctypes.byref(size), ctypes.byref(known)), "item metadata")
++                            original_name = ctypes.string_at(ctypes.addressof(name), length.value * 2).decode("utf-16-le", "strict")
++                            is_stream = self.kind == "ntfs" and flags.value == 32
++                            if flags.value & ~1 and not is_stream:
++                                raise ValueError(f"Entry has link, special, encrypted, deleted or alternate-stream metadata (flags 0x{flags.value:x})")
++                            if is_stream:
++                                # The decoder identifies a real NTFS alternate stream. Its
++                                # display path stays metadata, never a Win32 output path.
++                                stream_record = {"item_index": index, "source_path": original_name,
++                                                 "exported_name": f"{index}.bin", "status": "not-written"}
++                                estimate = len(json.dumps(stream_record).encode("utf-8")) + 512
++                                if estimate > metadata_bound - stream_metadata_bytes:
++                                    stream_record = None
++                                    raise ValueError("NTFS stream mapping exceeds its 4 MiB metadata bound")
++                                stream_metadata_bytes += estimate
++                                if stream_directory is None:
++                                    candidate = outdir / ("rea-ntfs-streams-" + uuid4().hex)
++                                    # Python's Win32 mode 0700 installs a user-only DACL,
++                                    # which excludes this restricted AppContainer token.
++                                    # Default mkdir inherits this task's exact output ACL.
++                                    candidate.mkdir()
++                                    stream_directory = candidate
++                                target = stream_directory / stream_record["exported_name"]
++                                stream_records.append(stream_record)
++                            else:
++                                relative = checked_windows_archive_path(
++                                    outdir, original_name, posix_source=self.kind in ("extfs", "cramfs", "squashfs"))
++                                target = outdir / relative
++                            if flags.value & 1:
++                                target.mkdir(parents=True, exist_ok=True)
++                                continue
++                            remaining = data_bound - total
++                            if known.value and size.value > remaining:
++                                raise ValueError("Entry exceeds the remaining 512 MiB output bound")
++                            target.parent.mkdir(parents=True, exist_ok=True)
++                            written, result, overflow = ctypes.c_uint64(), ctypes.c_int32(-1), ctypes.c_uint32()
++                            with target.open("xb") as output:
++                                status = bridge.rea7_extract(session, index, msvcrt.get_osfhandle(output.fileno()),
++                                    size.value if known.value else remaining, ctypes.byref(written),
++                                    ctypes.byref(result), ctypes.byref(overflow))
++                            total += written.value
++                            if overflow.value:
++                                raise ValueError("Decoder expansion exceeded the admitted entry/output bound")
++                            _checked(status, "extract")
++                            if result.value != 0:
++                                raise ValueError("Native archive decoding failed: " + RESULTS.get(result.value, f"unknown result {result.value}"))
++                            if known.value and written.value != size.value:
++                                raise EOFError("Decoder output disagrees with the declared entry size")
++                            if stream_record is not None:
++                                stream_record["status"] = "complete"
++                        except (ValueError, OSError, UnicodeError, EOFError) as error:
++                            if stream_record is not None:
++                                stream_record.update(status="partial", failure=str(error))
++                            reports.append(ExtractionProblem(path=original_name, problem=str(error),
++                                resolution="Skipped or partial; prior output and decoded source coordinate retained."))
++                        finally:
++                            if stream_record is not None and target is not None and target.is_file():
++                                stream_record["bytes"] = target.stat().st_size
++                                with target.open("rb") as retained:
++                                    stream_record["sha256"] = hashlib.file_digest(retained, "sha256").hexdigest()
++                finally:
++                    if session.value:
++                        status = bridge.rea7_close(session); session.value = None
++                        _checked(status, "close")
++        except Exception as error:
++            reports.append(UnknownError(exception=error))
++        finally:
++            if stream_directory is not None:
++                try:
++                    mapping = json.dumps({"schemaVersion": 1, "source_format": "ntfs",
++                        "representation": "alternate streams exported as ordinary files; source_path is decoder metadata",
++                        "entries": stream_records}, ensure_ascii=True, indent=2).encode("utf-8")
++                    if len(mapping) > metadata_bound:
++                        raise ValueError("NTFS stream mapping exceeds its 4 MiB metadata bound")
++                    with (stream_directory / "stream-map.json").open("xb") as manifest:
++                        manifest.write(mapping)
++                except Exception as error:
++                    reports.append(UnknownError(exception=error))
++        return ExtractResult(reports=reports)
+--- /dev/null
++++ b/python/unblob/windows_sparse_extractor.py
+@@ -0,0 +1,79 @@
++"""Materialize Android sparse data with the handler's parsed format facts."""
++import binascii
++import json
++import struct
++
++from unblob.models import Extractor, ExtractResult
++from unblob.report import UnknownError
++from unblob.windows_stream_extractors import CHUNK_BYTES, MAX_OUTPUT_BYTES
++
++MAP_BUDGET = 4 * 1024 * 1024
++
++
++class WindowsSparseExtractor(Extractor):
++    def extract(self, inpath, outdir):
++        from unblob.handlers.filesystem.android.sparse import SparseHandler
++        reports, unknown_ranges = [], []
++        complete = False
++        try:
++            with inpath.open("rb") as source:
++                header, chunks = SparseHandler().read_layout(source)
++                expected = header.total_blks * header.blk_sz
++                if expected > MAX_OUTPUT_BYTES-MAP_BUDGET:
++                    raise ValueError("Sparse expansion exceeds the output bound including its mapping")
++
++                def read_exact(amount):
++                    value = source.read(amount)
++                    if len(value) != amount:
++                        raise EOFError("Truncated Android sparse chunk")
++                    return value
++
++                crc = total = 0
++                with (outdir / "raw.image").open("xb") as output:
++                    def write(data):
++                        nonlocal crc, total
++                        if len(data) > expected-total:
++                            raise ValueError("Sparse chunks exceed the declared output extent")
++                        output.write(data)
++                        crc = binascii.crc32(data, crc)
++                        total += len(data)
++
++                    for chunk in chunks:
++                        if chunk.chunk_type == 0xCAC1:
++                            remaining = chunk.output_size
++                            while remaining:
++                                data = read_exact(min(CHUNK_BYTES, remaining))
++                                write(data)
++                                remaining -= len(data)
++                        elif chunk.chunk_type in (0xCAC2, 0xCAC3):
++                            if chunk.chunk_type == 0xCAC3 and chunk.output_size:
++                                if len(unknown_ranges) >= 10000:
++                                    raise ValueError("Sparse mapping exceeds its 10000-range bound")
++                                unknown_ranges.append({"source_chunk_offset": chunk.data_offset-header.chunk_hdr_sz,
++                                    "output_offset": chunk.output_offset, "bytes": chunk.output_size})
++                            pattern = read_exact(4) if chunk.chunk_type == 0xCAC2 else b"\0" * 4
++                            block = pattern * (CHUNK_BYTES // 4)
++                            remaining = chunk.output_size
++                            while remaining:
++                                amount = min(CHUNK_BYTES, remaining)
++                                write(block[:amount])
++                                remaining -= amount
++                        elif struct.unpack("<I", read_exact(4))[0] != crc:
++                            raise ValueError("Android sparse chunk CRC32 mismatch")
++                    if header.image_checksum and header.image_checksum != crc:
++                        raise ValueError("Android sparse image CRC32 mismatch")
++                complete = True
++        except Exception as error:
++            reports.append(UnknownError(exception=error))
++        if unknown_ranges:
++            mapping = {"schemaVersion": 1, "source_format": "android-sparse",
++                "output_file": "raw.image", "materialization_complete": complete,
++                "source_content": "DONT_CARE ranges are unspecified by the source image.",
++                "output_representation": "DONT_CARE ranges are zero-filled, including CRC calculation; this does not establish original bytes.",
++                "unknown_ranges": unknown_ranges}
++            encoded = json.dumps(mapping, indent=2).encode("utf-8")
++            if len(encoded) > MAP_BUDGET:
++                reports.append(UnknownError(exception=ValueError("Sparse mapping serialization exceeded its bound")))
++            else:
++                (outdir / "sparse-map.json").write_bytes(encoded)
++        return ExtractResult(reports=reports)
+--- /dev/null
++++ b/python/unblob/windows_stream_extractors.py
+@@ -0,0 +1,116 @@
++"""Native library-backed Windows decompression without shell subprocesses."""
++import bz2
++import contextlib
++import gzip
++import io
++import lzma
++import struct
++from pathlib import Path
++
++from unblob.models import ExtractError, Extractor
++from unblob.report import UnknownError
++from unblob.windows_archive_paths import checked_windows_archive_path
++
++CHUNK_BYTES = 64 * 1024
++# Matches the maximum output admitted by REA's firmware request contract.
++# The caller still enforces its smaller selected aggregate output budget.
++MAX_OUTPUT_BYTES = 512 * 1024 * 1024
++
++
++class JoinedInput(io.RawIOBase):
++    """A bounded sequential view over producer-ordered multi-volume files."""
++    def __init__(self, paths):
++        super().__init__()
++        self.paths = iter(paths)
++        self.current = None
++
++    def readable(self):
++        return True
++
++    def readinto(self, destination):
++        if not destination:
++            return 0
++        while True:
++            if self.current is None:
++                path = next(self.paths, None)
++                if path is None:
++                    return 0
++                self.current = Path(path).open('rb')
++            count = self.current.readinto(destination)
++            if count:
++                return count
++            self.current.close()
++            self.current = None
++
++    def close(self):
++        if self.current is not None:
++            self.current.close()
++            self.current = None
++        super().close()
++
++
++class WindowsStreamExtractor(Extractor):
++    def __init__(self, kind, filename):
++        self.kind = kind
++        self.filename = filename
++
++    def _reader(self, source):
++        if self.kind == 'gzip':
++            return gzip.GzipFile(fileobj=source, mode='rb')
++        if self.kind == 'bz2':
++            return bz2.BZ2File(source, mode='rb')
++        if self.kind in ('xz', 'lzma'):
++            return lzma.LZMAFile(source, mode='rb', format=lzma.FORMAT_XZ if self.kind == 'xz' else lzma.FORMAT_ALONE)
++        if self.kind == 'zstd':
++            from pyzstd import ZstdFile
++            return ZstdFile(source, mode='rb')
++        if self.kind == 'lz4':
++            from lz4.frame import LZ4FrameFile
++            return LZ4FrameFile(source, mode='rb')
++        raise ValueError('Unknown native decoder: '+self.kind)
++
++    def _chunks(self, source):
++        if self.kind == 'lz4' and source.peek(4)[:4] == b'\x02\x21\x4c\x18':
++            from lz4.block import decompress
++            source.read(4)
++            block_size = 8 * 1024 * 1024
++            compressed_bound = block_size + block_size // 255 + 16
++            while True:
++                header = source.read(4)
++                if not header:
++                    return
++                if len(header) != 4:
++                    raise EOFError('Incomplete LZ4 legacy block length')
++                length = struct.unpack('<I',header)[0]
++                if not 0 < length <= compressed_bound:
++                    raise ValueError('LZ4 legacy compressed block exceeds its format bound')
++                compressed = source.read(length)
++                if len(compressed) != length:
++                    raise EOFError('Incomplete LZ4 legacy block')
++                yield decompress(compressed, uncompressed_size=block_size)
++        else:
++            with self._reader(source) as reader:
++                while data := reader.read(CHUNK_BYTES):
++                    yield data
++
++    def extract_paths(self, paths, outdir):
++        try:
++            relative = checked_windows_archive_path(outdir, self.filename)
++            destination = outdir / relative
++            destination.parent.mkdir(parents=True,exist_ok=True)
++            with contextlib.ExitStack() as stack:
++                source = stack.enter_context(io.BufferedReader(JoinedInput(paths),buffer_size=CHUNK_BYTES))
++                output = stack.enter_context(destination.open('xb'))
++                total = 0
++                for data in self._chunks(source):
++                    if len(data) > MAX_OUTPUT_BYTES - total:
++                        raise ValueError('Native decompression exceeds the 512 MiB output bound')
++                    output.write(data)
++                    total += len(data)
++        except Exception as error:
++            # Preserve decoder failures and any partial output. Never report a
++            # checksum, truncation, dictionary or resource failure as success.
++            raise ExtractError(UnknownError(exception=error)) from error
++
++    def extract(self, inpath, outdir):
++        return self.extract_paths([inpath],outdir)
+--- /dev/null
++++ b/python/unblob/windows_ubi.py
+@@ -0,0 +1,51 @@
++"""Export verified UBI mappings as ordinary files, retaining source identities."""
++import hashlib
++import json
++
++from unblob.models import Extractor, ExtractResult
++from unblob.report import UnknownError
++from unblob.windows_stream_extractors import CHUNK_BYTES, MAX_OUTPUT_BYTES
++
++
++class WindowsUbiExtractor(Extractor):
++    def extract(self, inpath, outdir):
++        from ubireader.ubi.readonly import read_volumes
++        reports = []
++        try:
++            total = 0
++            mapping = []
++            with inpath.open("rb") as source:
++                peb, image_sequence, volumes = read_volumes(source, inpath.stat().st_size)
++                for volume in volumes:
++                    expected = sum(block.length for block in volume.blocks)
++                    if expected > MAX_OUTPUT_BYTES - 1024 * 1024 - total:
++                        raise ValueError("UBI observed volume bytes exceed the output bound")
++                    name = f"volume-{volume.number}.image"
++                    digest = hashlib.sha256()
++                    with (outdir / name).open("xb") as output:
++                        for block in volume.blocks:
++                            source.seek(block.position)
++                            remaining = block.length
++                            while remaining:
++                                data = source.read(min(CHUNK_BYTES, remaining))
++                                if not data:
++                                    raise EOFError("UBI source became truncated")
++                                output.write(data); digest.update(data)
++                                remaining -= len(data); total += len(data)
++                    table = volume.table
++                    mapping.append({"volume_id": volume.number, "source_name_bytes": table.name.hex(),
++                        "exported_name": name, "type": "static" if table.vol_type == 2 else "dynamic",
++                        "reserved_pebs": table.reserved_pebs, "observed_lebs": len(volume.blocks),
++                        "bytes": expected, "sha256": digest.hexdigest(),
++                        "source_pebs": [block.source_peb for block in volume.blocks],
++                        "source_sequences": [block.vid.sqnum for block in volume.blocks],
++                        "extent": "observed contiguous logical blocks; unallocated reserved tail is not materialized"})
++            record = json.dumps({"schemaVersion": 1, "physical_block_size": peb,
++                "image_sequence": image_sequence, "volumes": mapping}, indent=2).encode("utf-8")
++            if len(record) > 1024 * 1024:
++                raise ValueError("UBI mapping metadata exceeds its 1 MiB bound")
++            with (outdir / "ubi-volume-map.json").open("xb") as metadata:
++                metadata.write(record)
++        except Exception as error:
++            reports.append(UnknownError(exception=error))
++        return ExtractResult(reports=reports)
+--- /dev/null
++++ b/python/unblob/windows_ubifs.py
+@@ -0,0 +1,89 @@
++"""Materialize a validated UBIFS committed tree without mount, shell or links."""
++from collections import deque
++import stat
++
++from unblob.models import Extractor, ExtractResult
++from unblob.report import ExtractionProblem, UnknownError
++from unblob.windows_archive_paths import checked_windows_archive_path
++from unblob.windows_flash_codecs import decode_flash_node
++from unblob.windows_stream_extractors import CHUNK_BYTES, MAX_OUTPUT_BYTES
++
++
++class WindowsUbifsExtractor(Extractor):
++    def extract(self, inpath, outdir):
++        from ubireader.ubifs.readonly import CommittedTree
++        reports = []
++
++        def problem(coordinate, error):
++            if len(reports) >= 128:
++                raise ValueError("UBIFS diagnostic bound reached; remaining coverage is unknown")
++            reports.append(ExtractionProblem(path=coordinate, problem=str(error),
++                resolution="Committed-tree evidence retained; no repair or host filesystem metadata applied."))
++        try:
++            with inpath.open("rb") as source:
++                tree = CommittedTree(source, inpath.stat().st_size)
++            for note in tree.notes:
++                problem("<UBIFS committed index>", note)
++            pending = deque([(1, ())])
++            visited = set()
++            count = total = 0
++            while pending:
++                parent, path = pending.popleft()
++                if parent in visited or len(path) > 128:
++                    raise ValueError("UBIFS directory cycle, alias or depth bound")
++                visited.add(parent)
++                inode = tree.inodes.get(parent)
++                if inode is None or not stat.S_ISDIR(inode.mode):
++                    raise ValueError("UBIFS parent is not a verified directory inode")
++                for entry in tree.children[parent]:
++                    count += 1
++                    if count > 10_000:
++                        raise ValueError("UBIFS directory exceeds its 10000-entry output bound")
++                    original = "/".join((*path, entry.name))
++                    try:
++                        if entry.name in ("", ".", "..") or "/" in entry.name:
++                            raise ValueError("Invalid UBIFS filename component")
++                        target = outdir / checked_windows_archive_path(outdir, original, posix_source=True)
++                        inode = tree.inodes.get(entry.inum)
++                        if inode is None:
++                            raise ValueError("UBIFS directory target inode is absent")
++                        if entry.type == 1 and stat.S_ISDIR(inode.mode):
++                            target.mkdir(parents=True, exist_ok=True)
++                            pending.append((entry.inum, (*path, entry.name)))
++                            continue
++                        if entry.type != 0 or not stat.S_ISREG(inode.mode) or inode.data_len:
++                            raise ValueError("UBIFS link, special or inconsistent inode was not materialized")
++                        if inode.flags & ~31:
++                            raise ValueError("UBIFS inode has extended, encrypted or unknown flags")
++                        if inode.size > MAX_OUTPUT_BYTES - total:
++                            raise ValueError("UBIFS file exceeds the remaining 512 MiB output bound")
++                        blocks = tree.data.get(entry.inum, {})
++                        if any(block * 4096 >= inode.size for block in blocks):
++                            raise ValueError("UBIFS data block is beyond the committed file extent")
++                        target.parent.mkdir(parents=True, exist_ok=True)
++                        with target.open("xb") as output:
++                            cursor = 0
++                            for block, fact in sorted(blocks.items()):
++                                # Full index validation proves absent block keys are holes in
++                                # this committed snapshot, not undecodable or missing nodes.
++                                start = block * 4096
++                                while cursor < start:
++                                    amount = min(CHUNK_BYTES, start - cursor)
++                                    output.write(bytes(amount)); total += amount; cursor += amount
++                                expected = min(4096, inode.size - start)
++                                if fact.node.size != expected:
++                                    raise ValueError("UBIFS data node does not cover its committed block extent")
++                                codec = {0: "none", 1: "lzo", 2: "deflate", 3: "zstd"}.get(fact.node.compr_type)
++                                data = decode_flash_node(fact.encoded, expected, codec)
++                                output.write(data); total += len(data); cursor += len(data)
++                            while cursor < inode.size:
++                                amount = min(CHUNK_BYTES, inode.size - cursor)
++                                output.write(bytes(amount)); total += amount; cursor += amount
++                    except (ValueError, OSError, UnicodeError, EOFError) as error:
++                        problem(original, error)
++            unreachable = sum(len(children) for parent, children in tree.children.items() if parent not in visited)
++            if unreachable:
++                problem("<UBIFS committed index>", f"{unreachable} entries have unreachable or rejected parents")
++        except Exception as error:
++            reports.append(UnknownError(exception=error))
++        return ExtractResult(reports=reports)
+--- /dev/null
++++ b/python/unblob/windows_xad.py
+@@ -0,0 +1,129 @@
++"""Decode fixed legacy formats and retain fork/name semantics in a mapping."""
++import ctypes
++from functools import lru_cache
++import hashlib
++import json
++from pathlib import Path
++from uuid import uuid4
++
++from unblob.models import Extractor, ExtractResult
++from unblob.report import ExtractionProblem, UnknownError
++from unblob.windows_stream_extractors import CHUNK_BYTES, MAX_OUTPUT_BYTES
++
++MAP_BUDGET = 4 * 1024 * 1024
++
++
++@lru_cache(maxsize=1)
++def _library():
++    lib = ctypes.CDLL(str(Path(__file__).parent/'_windows_native/rea-xad.dll'), winmode=0x100|0x800)
++    ptr, uint, integer, u64 = ctypes.c_void_p, ctypes.c_uint, ctypes.c_int, ctypes.c_uint64
++    signatures = {
++        'reaxad_open': [ptr,uint,ctypes.POINTER(ptr)],
++        'reaxad_close': [ptr],
++        'reaxad_count': [ptr,ctypes.POINTER(uint),ctypes.POINTER(integer)],
++        'reaxad_item': [ptr,uint,ptr,uint,ctypes.POINTER(uint),ctypes.POINTER(u64),ctypes.POINTER(uint)],
++        'reaxad_begin': [ptr,uint,ctypes.POINTER(uint)],
++        'reaxad_read': [ptr,ptr,uint],
++        'reaxad_error': [ptr,ptr,uint],
++    }
++    for name, arguments in signatures.items():
++        method = getattr(lib,name); method.argtypes=arguments; method.restype=integer
++    return lib
++
++
++class WindowsXadExtractor(Extractor):
++    def __init__(self, kind):
++        self.kind = kind
++        self.selector = {'arc':0,'stuffit':1,'stuffit5':2}[kind]
++
++    def extract(self, inpath, outdir):
++        import msvcrt
++        reports, entries = [], []
++        mapped = total = 0
++        target = outdir/('archive-streams-'+uuid4().hex)
++
++        def problem(coordinate,error):
++            if len(reports)>=128:
++                raise ValueError('Legacy archive diagnostic limit reached')
++            reports.append(ExtractionProblem(path=coordinate,problem=str(error),
++                resolution='Original archive retained; data and resource forks are regular mapped files, never host streams or links.'))
++        try:
++            lib = _library(); session = ctypes.c_void_p()
++
++            def checked(status,action):
++                if status<0:
++                    detail=ctypes.create_string_buffer(2048)
++                    if session.value:
++                        lib.reaxad_error(session,detail,len(detail))
++                    raise ValueError(f'Native {self.kind} {action} failed ({status}): '+detail.value.decode('utf-8','backslashreplace'))
++                return status
++
++            with inpath.open('rb') as source:
++                try:
++                    checked(lib.reaxad_open(msvcrt.get_osfhandle(source.fileno()),self.selector,ctypes.byref(session)),'open')
++                    count,error=ctypes.c_uint(),ctypes.c_int()
++                    checked(lib.reaxad_count(session,ctypes.byref(count),ctypes.byref(error)),'inventory')
++                    if count.value>10000:
++                        raise ValueError('Legacy archive inventory exceeded its entry bound')
++                    if error.value:
++                        problem('<archive inventory>',f'Decoder did not complete inventory (XAD error {error.value})')
++                    target.mkdir()
++                    buffer=ctypes.create_string_buffer(CHUNK_BYTES)
++                    for index in range(count.value):
++                        coordinate=f'<{self.kind} entry {index}>'
++                        entry={'index':index,'status':'unknown'}
++                        try:
++                            length,flags=ctypes.c_uint(),ctypes.c_uint();size=ctypes.c_uint64()
++                            checked(lib.reaxad_item(session,index,buffer,len(buffer),ctypes.byref(length),ctypes.byref(size),ctypes.byref(flags)),'metadata')
++                            if length.value>len(buffer):
++                                raise ValueError('Native metadata exceeded its admitted buffer')
++                            raw=buffer.raw[:length.value]
++                            # JSON escaping can expand UTF-8 metadata at most sixfold.
++                            reservation=len(raw)*6+1024
++                            if reservation>MAP_BUDGET-mapped:
++                                raise ValueError('Legacy archive mapping exceeds its 4 MiB bound')
++                            mapped+=reservation
++                            entry.update(json.loads(raw))
++                            if flags.value&1:
++                                entry['status']='directory-metadata';entries.append(entry);continue
++                            if flags.value&(4|8|16):
++                                raise ValueError('Link, special, encrypted or corrupt entry was not materialized')
++                            if size.value>MAX_OUTPUT_BYTES-MAP_BUDGET-total:
++                                raise ValueError('Legacy archive exceeds its remaining output bound')
++                            checksum=ctypes.c_uint()
++                            checked(lib.reaxad_begin(session,index,ctypes.byref(checksum)),'begin')
++                            name=f'{index:05d}.bin';entry['exported_name']=name
++                            digest=hashlib.sha256();written=0
++                            with (target/name).open('xb') as output:
++                                while True:
++                                    amount=checked(lib.reaxad_read(session,buffer,len(buffer)),'read/checksum')
++                                    if amount==0:break
++                                    if amount>len(buffer) or amount>size.value-written or amount>MAX_OUTPUT_BYTES-MAP_BUDGET-total:
++                                        raise ValueError('Legacy archive decoder exceeded its admitted size')
++                                    data=buffer.raw[:amount];output.write(data);digest.update(data)
++                                    written+=amount;total+=amount
++                            if written!=size.value:
++                                raise EOFError('Legacy archive data ended before its declared length')
++                            entry.update(status='complete',bytes=written,sha256=digest.hexdigest(),checksum_verified=bool(checksum.value))
++                        except (ValueError,OSError,EOFError) as failure:
++                            entry['status']='partial';entry['error']=str(failure)[:2048]
++                            problem(coordinate,failure)
++                        entries.append(entry)
++                        if mapped>=MAP_BUDGET-32768:
++                            problem('<archive inventory>','Mapping capacity reached; remaining entries are unknown');break
++                finally:
++                    if session.value:
++                        status=lib.reaxad_close(session)
++                        if status:
++                            checked(status,'close')
++                        session.value=None
++        except Exception as error:
++            reports.append(UnknownError(exception=error))
++        if target.is_dir():
++            mapping={'schemaVersion':1,'source_format':self.kind,'source_coordinates':'Decoder path bytes; the original archive retains full record bytes. Display names may be inferred and are not host paths.','entries':entries}
++            encoded=json.dumps(mapping,ensure_ascii=True,indent=2).encode('utf-8')
++            if len(encoded)>MAP_BUDGET:
++                reports.append(UnknownError(exception=ValueError('Legacy archive mapping serialization exceeded its bound')))
++            else:
++                (target/'archive-map.json').write_bytes(encoded)
++        return ExtractResult(reports=reports)
+--- /dev/null
++++ b/python/unblob/windows_zip_extractor.py
+@@ -0,0 +1,54 @@
++"""Extract ZIP with the admitted native Python codecs and Windows path checks."""
++import stat
++import zipfile
++from unblob.models import Extractor, ExtractResult
++from unblob.report import ExtractionProblem, UnknownError
++from unblob.windows_archive_paths import checked_windows_archive_path
++from unblob.windows_stream_extractors import CHUNK_BYTES, MAX_OUTPUT_BYTES
++
++
++class WindowsZipExtractor(Extractor):
++    def extract(self, inpath, outdir):
++        reports = []
++        total = 0
++        with zipfile.ZipFile(inpath) as archive:
++            for member in archive.infolist():
++                original_name = member.orig_filename
++                try:
++                    relative = checked_windows_archive_path(outdir, original_name, posix_source=True)
++                    if original_name != member.filename:
++                        raise ValueError("ZIP decoder normalized the original archive filename")
++                    target = outdir / relative
++                    mode = member.external_attr >> 16
++                    file_type = stat.S_IFMT(mode)
++                    if file_type not in (0, stat.S_IFREG, stat.S_IFDIR):
++                        reports.append(ExtractionProblem(
++                            path=original_name,
++                            problem=f"ZIP entry is not a regular file or directory (source mode {mode:o}).",
++                            resolution="Entry metadata retained; no special file or link created.",
++                        ))
++                        continue
++                    if member.is_dir():
++                        target.mkdir(parents=True, exist_ok=True)
++                        continue
++                    if member.file_size > MAX_OUTPUT_BYTES - total:
++                        raise ValueError("ZIP entry exceeds the remaining 512 MiB output bound")
++                    target.parent.mkdir(parents=True, exist_ok=True)
++                    written = 0
++                    with archive.open(member) as source, target.open('xb') as output:
++                        while data := source.read(CHUNK_BYTES):
++                            if len(data) > MAX_OUTPUT_BYTES - total or len(data) > member.file_size - written:
++                                raise ValueError("ZIP expansion exceeds its admitted size")
++                            output.write(data)
++                            written += len(data)
++                            total += len(data)
++                    if written != member.file_size:
++                        raise EOFError("ZIP entry ended before its declared size")
++                except (ValueError, FileExistsError) as error:
++                    reports.append(ExtractionProblem(
++                        path=original_name, problem=str(error),
++                        resolution="Skipped; prior output and original archive coordinates retained.",
++                    ))
++                except Exception as error:
++                    reports.append(UnknownError(exception=error))
++        return ExtractResult(reports=reports)

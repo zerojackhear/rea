@@ -1,0 +1,242 @@
+--- a/src/hyperscan/extension.c
++++ b/src/hyperscan/extension.c
+@@ -987,7 +987,6 @@
+     (PyObject *)&StreamType, "OIOO", (PyObject *)self, flags, ocallback, octx);
+   if (PyErr_Occurred())
+     HS_LOCK_RETURN_NULL();
+-  Py_INCREF(stream);
+   HS_LOCK_RETURN(stream);
+ }
+ 
+@@ -1120,55 +1119,80 @@
+   Database_new,            /* tp_new */
+ };
+ 
++static int Stream_traverse(Stream *self, visitproc visit, void *arg)
++{
++  Py_VISIT(self->database);
++  Py_VISIT(self->scratch);
++  if (self->cctx != NULL) {
++    Py_VISIT(self->cctx->callback);
++    Py_VISIT(self->cctx->ctx);
++  }
++  return 0;
++}
++
++static int Stream_clear(Stream *self)
++{
++  if (self->identifier != NULL) {
++    hs_close_stream(self->identifier, NULL, NULL, NULL);
++    self->identifier = NULL;
++  }
++  Py_CLEAR(self->database);
++  Py_CLEAR(self->scratch);
++  if (self->cctx != NULL) {
++    Py_CLEAR(self->cctx->callback);
++    Py_CLEAR(self->cctx->ctx);
++  }
++  return 0;
++}
++
+ static void Stream_dealloc(Stream *self)
+ {
+-  if (self->cctx != NULL)
+-    free(self->cctx);
++  PyObject_GC_UnTrack(self);
++  Stream_clear(self);
++  free(self->cctx);
+   Py_TYPE(self)->tp_free((PyObject *)self);
+ }
+ 
+ static PyObject *Stream_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
+ {
+-  Stream *self;
+-
+-  self = (Stream *)type->tp_alloc(type, 0);
+-  if (self != NULL) {
+-    self->flags = 0;
+-    self->database = Py_None;
+-    self->scratch = Py_None;
+-  }
+-
++  Stream *self = (Stream *)type->tp_alloc(type, 0);
++  if (self == NULL) return NULL;
++  self->database = Py_NewRef(Py_None);
++  self->scratch = Py_NewRef(Py_None);
++  self->cctx = calloc(1, sizeof(py_scan_callback_ctx));
++  if (self->cctx == NULL) {
++    Py_DECREF(self);
++    return PyErr_NoMemory();
++  }
++  self->cctx->callback = Py_NewRef(Py_None);
++  self->cctx->ctx = Py_NewRef(Py_None);
+   return (PyObject *)self;
+ }
+ 
+ static int Stream_init(Stream *self, PyObject *args, PyObject *kwds)
+ {
+-  static char *kwlist[] = {
+-    "database",
+-    "flags",
+-    "match_event_handler",
+-    "context",
+-    "scratch",
+-    NULL,
+-  };
+-  self->cctx = malloc(sizeof(py_scan_callback_ctx));
+-  if (!PyArg_ParseTupleAndKeywords(
+-        args,
+-        kwds,
+-        "O|IOOO!",
+-        kwlist,
+-        &self->database,
+-        &self->flags,
+-        &self->cctx->callback,
+-        &self->cctx->ctx,
+-        &self->scratch,
+-        &ScratchType))
++  static char *kwlist[] = {"database", "flags", "match_event_handler", "context", "scratch", NULL};
++  PyObject *database, *callback = Py_None, *context = Py_None, *scratch = Py_None;
++  unsigned int flags = 0;
++  if (self->identifier != NULL) {
++    PyErr_SetString(PyExc_ValueError, "Cannot reinitialize an open stream");
+     return -1;
+-  if (!PyObject_IsInstance(self->database, (PyObject *)&DatabaseType)) {
+-    PyErr_SetString(
+-      PyExc_TypeError, "database must be a hyperscan.Database instance");
++  }
++  if (!PyArg_ParseTupleAndKeywords(args, kwds, "O|IOOO!", kwlist,
++      &database, &flags, &callback, &context, &ScratchType, &scratch)) return -1;
++  if (!PyObject_TypeCheck(database, &DatabaseType)) {
++    PyErr_SetString(PyExc_TypeError, "database must be a hyperscan.Database instance");
+     return -1;
+   }
++  if (callback != Py_None && !PyCallable_Check(callback)) {
++    PyErr_SetString(PyExc_TypeError, "match_event_handler must be callable or None");
++    return -1;
++  }
++  Py_SETREF(self->database, Py_NewRef(database));
++  Py_SETREF(self->scratch, Py_NewRef(scratch));
++  Py_SETREF(self->cctx->callback, Py_NewRef(callback));
++  Py_SETREF(self->cctx->ctx, Py_NewRef(context));
++  self->flags = flags;
+   return 0;
+ }
+ 
+@@ -1177,7 +1201,8 @@
+   HS_LOCK_DECLARE();
+   HS_LOCK_ACQUIRE_OR_RETURN_NULL();
+ 
+-  py_scan_callback_ctx cctx;
++  if (self->identifier == NULL) HS_LOCK_RETURN(Py_NewRef(Py_None));
++  py_scan_callback_ctx cctx = {NULL, NULL, 1};
+   PyObject *oscratch = Py_None, *ocallback = Py_None, *octx = Py_None;
+   static char *kwlist[] = {"scratch", "match_event_handler", "context", NULL};
+   if (!PyArg_ParseTupleAndKeywords(
+@@ -1185,8 +1210,8 @@
+         kwds,
+         "|O!OO",
+         kwlist,
++        &ScratchType,
+         &oscratch,
+-        &ScratchType,
+         &ocallback,
+         &octx))
+     HS_LOCK_RETURN_NULL();
+@@ -1202,14 +1227,17 @@
+     scratch = (Scratch *)db->scratch;
+ 
+   hs_scratch_t *hs_scratch = scratch->hs_scratch;
+-  hs_error_t hs_err = hs_close_stream(
+-    self->identifier, hs_scratch, hs_match_handler, (void *)&cctx);
++  hs_stream_t *closing = self->identifier;
++  self->identifier = NULL;
++  hs_error_t hs_err = hs_close_stream(closing, hs_scratch,
++    cctx.callback == Py_None ? NULL : hs_match_handler,
++    cctx.callback == Py_None ? NULL : (void *)&cctx);
+   HANDLE_HYPERSCAN_ERR(hs_err, NULL);
+ 
+   HS_LOCK_RETURN(Py_NewRef(Py_None));
+ }
+ 
+-static long Stream_len(PyObject *self)
++static Py_ssize_t Stream_len(PyObject *self)
+ {
+   HS_LOCK_DECLARE();
+   HS_LOCK_ACQUIRE_OR_RETURN_NEG1();
+@@ -1222,8 +1250,8 @@
+     HS_LOCK_RETURN_INT(0);
+   }
+   hs_error_t err = hs_stream_size(db->hs_db, &stream_size);
+-  HANDLE_HYPERSCAN_ERR(err, 0);
+-  HS_LOCK_RETURN_INT((long)stream_size);
++  HANDLE_HYPERSCAN_ERR(err, -1);
++  HS_LOCK_RETURN_INT((Py_ssize_t)stream_size);
+ }
+ 
+ static PyObject *Stream_enter(Stream *self)
+@@ -1237,9 +1265,13 @@
+     PyErr_SetString(PyExc_RuntimeError, "chimera does not support streams");
+     HS_LOCK_RETURN_NULL();
+   }
++  if (self->identifier != NULL) {
++    PyErr_SetString(PyExc_ValueError, "Stream is already open");
++    HS_LOCK_RETURN_NULL();
++  }
+   hs_error_t err = hs_open_stream(db->hs_db, 0, &self->identifier);
+   HANDLE_HYPERSCAN_ERR(err, NULL);
+-  HS_LOCK_RETURN((PyObject *)self);
++  HS_LOCK_RETURN(Py_NewRef((PyObject *)self));
+ }
+ 
+ static PyObject *Stream_exit(Stream *self)
+@@ -1247,7 +1279,8 @@
+   HS_LOCK_DECLARE();
+   HS_LOCK_ACQUIRE_OR_RETURN_NULL();
+ 
+-  PyObject_CallMethod((PyObject *)self, "close", NULL);
++  PyObject *closed = PyObject_CallMethod((PyObject *)self, "close", NULL);
++  Py_XDECREF(closed);
+   if (PyErr_Occurred())
+     HS_LOCK_RETURN_NULL();
+   HS_LOCK_RETURN(Py_NewRef(Py_None));
+@@ -1258,6 +1291,10 @@
+   HS_LOCK_DECLARE();
+   HS_LOCK_ACQUIRE_OR_RETURN_NULL();
+ 
++  if (self->identifier == NULL) {
++    PyErr_SetString(PyExc_ValueError, "Stream is not open");
++    HS_LOCK_RETURN_NULL();
++  }
+   Py_buffer view;
+   uint32_t flags = 0;
+   PyObject *ocallback = Py_None, *octx = Py_None, *oscratch = Py_None;
+@@ -1326,7 +1363,7 @@
+   {"database",
+    T_OBJECT_EX,
+    offsetof(Stream, database),
+-   0,
++   READONLY,
+    ":class:`Database`: Database instance."},
+   {"flags", T_INT, offsetof(Stream, flags), 0, "int: Stream flags."},
+   {NULL}};
+@@ -1395,7 +1432,7 @@
+   0,                                                 /* tp_getattro */
+   0,                                                 /* tp_setattro */
+   0,                                                 /* tp_as_buffer */
+-  Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,          /* tp_flags */
++  Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE | Py_TPFLAGS_HAVE_GC,          /* tp_flags */
+   "Stream(database=None, flags=0, match_event_handler=None)\n\n"
+   "    Provides a context manager for scanning streams of text.\n\n"
+   "    Args:\n"
+@@ -1407,8 +1444,8 @@
+   "            expression id, start offset, end offset, flags, and a\n"
+   "            context object."
+   "\n\n",                /* tp_doc */
+-  0,                     /* tp_traverse */
+-  0,                     /* tp_clear */
++  (traverseproc)Stream_traverse, /* tp_traverse */
++  (inquiry)Stream_clear,   /* tp_clear */
+   0,                     /* tp_richcompare */
+   0,                     /* tp_weaklistoffset */
+   0,                     /* tp_iter */

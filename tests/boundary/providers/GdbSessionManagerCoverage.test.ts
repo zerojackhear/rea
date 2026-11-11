@@ -23,7 +23,10 @@ import type {
 } from "../../../src/process/ProviderProcess.js";
 import { stopOwnedDebuggerProcess } from "../../../src/process/ownedDebuggerSession.js";
 import { parseLinuxProcessStartTime } from "../../../src/process/ProcessOwnershipObservation.js";
-import { expectGdbSessionStarted } from "./gdbTestHelpers.js";
+import {
+  expectGdbSessionStarted,
+  spawnNodeGdbFixture,
+} from "./gdbTestHelpers.js";
 
 let directory: string | undefined;
 const managers: GdbSessionManager[] = [];
@@ -126,10 +129,15 @@ it("rejects an invalid caller TTY and platforms without safe GDB ownership", asy
     error: { _tag: "AnalysisCapabilityUnavailableError" },
   });
   if (!macUnavailable.ok)
-    expect(macUnavailable.error.message).toContain("available only on Linux");
+    expect(macUnavailable.error.message).toContain(
+      "verify live inferior output identity",
+    );
   expect(macSpawned).toBe(false);
 
-  const windows = new GdbSessionManager({ platform: "win32" });
+  const windows = new GdbSessionManager({
+    platform: "win32",
+    environment: { REA_GDB_COMMAND: "C:\\rea-missing-test-gdb\\gdb.exe" },
+  });
   managers.push(windows);
   const unavailable = await windows.start();
   expect(unavailable).toMatchObject({
@@ -365,7 +373,7 @@ it("preserves cancellation and cleanup details when startup stop is uncertain", 
             status: "incomplete",
             reason: "simulated startup cancellation cleanup uncertainty",
           }
-        : stopOwnedDebuggerProcess(session, name);
+        : stopOwnedDebuggerProcess(session, name, { platform: "linux" });
     },
   });
 
@@ -1103,6 +1111,7 @@ const managerFor = async (
   const manager = new GdbSessionManager({
     platform: "linux",
     environment: { REA_GDB_COMMAND: await createProvider(body) },
+    spawnProcess: spawnNodeGdbFixture,
     ...options,
   });
   managers.push(manager);
@@ -1168,6 +1177,7 @@ ${responsiveProvider()}
   const manager = new GdbSessionManager({
     platform: "linux",
     environment: { REA_GDB_COMMAND: provider },
+    spawnProcess: spawnNodeGdbFixture,
   });
   managers.push(manager);
 
@@ -1184,13 +1194,14 @@ it("retains ownership when GDB startup fails before its prompt and stop is incom
   const manager = new GdbSessionManager({
     platform: "linux",
     environment: { REA_GDB_COMMAND: provider },
+    spawnProcess: spawnNodeGdbFixture,
     stopProcess: async (session, name) => {
       stopCalls += 1;
       if (stopCalls === 1) {
         retainedSessionId = (session as typeof session & { id: string }).id;
         return { status: "incomplete", reason: "simulated stop uncertainty" };
       }
-      return stopOwnedDebuggerProcess(session, name);
+      return stopOwnedDebuggerProcess(session, name, { platform: "linux" });
     },
   });
   managers.push(manager);
@@ -1230,6 +1241,7 @@ it("returns startup timeout when the MI prompt never arrives", async () => {
   const manager = new GdbSessionManager({
     platform: "linux",
     environment: { REA_GDB_COMMAND: provider },
+    spawnProcess: spawnNodeGdbFixture,
     startupTimeoutMs: 20,
   });
   managers.push(manager);
@@ -1301,6 +1313,7 @@ it("retains startup timeout without partial evidence when cleanup is uncertain",
   const manager = new GdbSessionManager({
     platform: "linux",
     environment: { REA_GDB_COMMAND: provider },
+    spawnProcess: spawnNodeGdbFixture,
     startupTimeoutMs: 20,
     stopProcess: async (session, name) => {
       stopCalls += 1;
@@ -1309,7 +1322,7 @@ it("retains startup timeout without partial evidence when cleanup is uncertain",
             status: "incomplete",
             reason: "simulated startup timeout cleanup uncertainty",
           }
-        : stopOwnedDebuggerProcess(session, name);
+        : stopOwnedDebuggerProcess(session, name, { platform: "linux" });
     },
   });
   managers.push(manager);
@@ -1384,6 +1397,7 @@ it("handles a start signal that becomes aborted during listener registration", a
   const manager = new GdbSessionManager({
     platform: "linux",
     environment: { REA_GDB_COMMAND: provider },
+    spawnProcess: spawnNodeGdbFixture,
   });
   managers.push(manager);
 
@@ -2296,11 +2310,12 @@ it("retains a session when closing cannot confirm the debugger process stopped",
   const manager = new GdbSessionManager({
     platform: "linux",
     environment: { REA_GDB_COMMAND: provider },
+    spawnProcess: spawnNodeGdbFixture,
     stopProcess: async (session, name) => {
       stopCalls += 1;
       if (stopCalls === 1)
         return { status: "incomplete", reason: "simulated close uncertainty" };
-      return stopOwnedDebuggerProcess(session, name);
+      return stopOwnedDebuggerProcess(session, name, { platform: "linux" });
     },
   });
   managers.push(manager);
@@ -2349,11 +2364,14 @@ it("preserves a command timeout when stopping the owned process rejects", async 
   const manager = new GdbSessionManager({
     platform: "linux",
     environment: { REA_GDB_COMMAND: provider },
-    commandTimeoutMs: 25,
+    spawnProcess: spawnNodeGdbFixture,
+    // Native Windows output polling is 25 ms; do not race startup against one
+    // polling interval. The requested console command still never replies.
+    commandTimeoutMs: 250,
     stopProcess: async (session, name) => {
       stopCalls += 1;
       if (stopCalls === 1) throw new Error("simulated stop failure");
-      return stopOwnedDebuggerProcess(session, name);
+      return stopOwnedDebuggerProcess(session, name, { platform: "linux" });
     },
   });
   managers.push(manager);
@@ -2380,7 +2398,7 @@ it("reports cancellation if owned-process stop rejects during an active command"
     stopProcess: async (session, name) => {
       stopCalls += 1;
       if (stopCalls === 1) throw new Error("simulated stop rejection");
-      return stopOwnedDebuggerProcess(session, name);
+      return stopOwnedDebuggerProcess(session, name, { platform: "linux" });
     },
   });
   const started = await expectGdbSessionStarted(manager);
@@ -2796,7 +2814,7 @@ it("preserves the protocol failure when an incomplete stop adds uncertainty", as
           reason: "simulated protocol stop uncertainty",
         };
       }
-      return stopOwnedDebuggerProcess(session, name);
+      return stopOwnedDebuggerProcess(session, name, { platform: "linux" });
     },
   });
   const started = await expectGdbSessionStarted(manager);
@@ -2905,7 +2923,7 @@ it("reports command timeout when an incomplete stop cannot confirm process exit"
           status: "incomplete",
           reason: "simulated timeout stop uncertainty",
         };
-      return stopOwnedDebuggerProcess(session, name);
+      return stopOwnedDebuggerProcess(session, name, { platform: "linux" });
     },
   });
   const started = await expectGdbSessionStarted(manager);

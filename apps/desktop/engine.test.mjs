@@ -72,6 +72,7 @@ async function fixture(t, call, options = {}) {
     connect: async (_root, onFault) => {
       options.connected?.(onFault);
       return {
+        executionEnvironment: options.executionEnvironment,
         tools: options.tools ?? [
           { name: "inspect_go_binary", inputSchema: { type: "object" } },
         ],
@@ -235,6 +236,35 @@ test("serial queue cancels waiting work without calling MCP, and preserves a run
   assert.equal(cancelled.task.state, "cancelled");
   assert.equal(cancelled.diagnostics.serverSettlement, "unconfirmed");
   assert.equal("result" in cancelled, false);
+});
+
+test("native submission preserves Windows paths and canonical Evidence unchanged", async (t) => {
+  const original = { path: "C:\\中文 目录\\target" };
+  const result = {
+    content: [{ type: "text", text: "Windows observation" }],
+    structuredContent: {
+      path: original.path,
+      evidence_id: "ev:windows-original",
+    },
+  };
+  const { engine, calls } = await fixture(t, async () => result, {
+    executionEnvironment: { kind: "win32" },
+  });
+  const task = await engine.dispatch(
+    request("submit", { tool: "inspect_go_binary", arguments: original }),
+  );
+  await until(
+    () => engine.dispatch(request("history")),
+    (rows) => rows[0]?.state === "completed",
+  );
+  const stored = await engine.dispatch(request("result", { id: task.id }));
+  assert.deepEqual(calls[0].input.arguments, {
+    path: result.structuredContent.path,
+  });
+  assert.deepEqual(stored.task.arguments, original);
+  assert.equal("pathMappings" in stored.task, false);
+  assert.equal(stored.task.executionEnvironment.kind, "win32");
+  assert.deepEqual(stored.result, result);
 });
 
 test("MCP isError remains a failed task with the original error content", async (t) => {

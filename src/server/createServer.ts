@@ -40,6 +40,8 @@ import {
   createToolResultDelivery,
   type ToolResultDelivery,
 } from "./toolResult.js";
+import { AGENT_REVIEW_INSTRUCTIONS } from "./agentReview.js";
+import { parseMcpAgentReview } from "../config/mcpAgentReview.js";
 import { parseMcpResponseBudget } from "../config/mcpResponseBudget.js";
 import { parseMcpOutputSchemaProfile } from "../config/mcpOutputSchemaProfile.js";
 import {
@@ -192,21 +194,30 @@ const installSessionToolAvailability = (
   if (session === undefined) return undefined;
   const linux = process.platform === "linux";
   const linuxX64 = linux && process.arch === "x64";
+  const offlineCaptureHost =
+    linux || (process.platform === "win32" && process.arch === "x64");
   const pwntools =
-    linuxX64 && isAbsolute(environment.REA_PWNTOOLS_PYTHON ?? "");
+    offlineCaptureHost &&
+    process.arch === "x64" &&
+    isAbsolute(environment.REA_PWNTOOLS_PYTHON ?? "");
   const basePolicy = sessionAvailabilityPolicy(options.availabilityPolicy, {
     optionalProviderLoadFailures: options.optionalProviderLoadFailures,
     optionalFeatures: {
       packetCaptureEnabled:
         options.packetCapture !== undefined ||
-        (linux && isAbsolute(environment.REA_TSHARK_COMMAND ?? "")),
+        (offlineCaptureHost &&
+          isAbsolute(environment.REA_TSHARK_COMMAND ?? "")),
       signalRecordingEnabled:
         options.signalRecording !== undefined ||
-        (linux && isAbsolute(environment.REA_SIGROK_COMMAND ?? "")),
+        (offlineCaptureHost &&
+          isAbsolute(environment.REA_SIGROK_COMMAND ?? "")),
       wasmArtifactEnabled:
         options.wasmArtifact !== undefined ||
         isAbsolute(environment.REA_WABT_BIN_DIRECTORY ?? ""),
-      evmInterfaceEnabled: options.evmInterface !== undefined || linuxX64,
+      evmInterfaceEnabled:
+        options.evmInterface !== undefined ||
+        linuxX64 ||
+        (process.platform === "win32" && process.arch === "x64"),
       webModuleResolutionEnabled:
         options.webModuleTrace !== undefined ||
         isAbsolute(environment.REA_BROWSER_EXECUTABLE ?? ""),
@@ -214,14 +225,18 @@ const installSessionToolAvailability = (
       binaryLayoutEnabled: options.binaryLayout !== undefined || pwntools,
       firmwareInspectionEnabled:
         options.firmwareAnalysis !== undefined ||
-        (linux && isAbsolute(environment.REA_BINWALK_COMMAND ?? "")),
+        (offlineCaptureHost &&
+          isAbsolute(environment.REA_BINWALK_COMMAND ?? "")),
       firmwareExtractionEnabled:
         options.firmwareAnalysis !== undefined ||
-        (linux && isAbsolute(environment.REA_UNBLOB_COMMAND ?? "")),
+        (offlineCaptureHost &&
+          isAbsolute(environment.REA_UNBLOB_COMMAND ?? "")),
       browserObservationEnabled: options.browserObservation !== undefined,
       javascriptRecoveryEnabled:
         options.javascriptRecovery !== undefined ||
-        (linuxX64 && isAbsolute(environment.REA_WAKARU_COMMAND ?? "")),
+        ((linuxX64 ||
+          (process.platform === "win32" && process.arch === "x64")) &&
+          isAbsolute(environment.REA_WAKARU_COMMAND ?? "")),
       browserScenarioEnabled: options.browserScenarioCapture !== undefined,
       electronObservationEnabled: options.electronObservation !== undefined,
       electronAutomationEnabled:
@@ -267,7 +282,7 @@ const createMcpServer = (
         session === undefined
           ? ACTIVE_TARGET_INSTRUCTIONS
           : TARGET_FREE_INSTRUCTIONS
-      } ${UNTRUSTED_CONTENT_INSTRUCTIONS}`,
+      } ${UNTRUSTED_CONTENT_INSTRUCTIONS}${delivery.reviewAfterAnalysis ? ` ${AGENT_REVIEW_INSTRUCTIONS}` : ""}`,
     },
     session === undefined
       ? undefined
@@ -597,7 +612,9 @@ const selectToolResultDelivery = (
     environment.REA_MCP_MAX_RESPONSE_BYTES,
   );
   if (!configured.ok) throw configured.error;
-  return createToolResultDelivery(configured.value);
+  const review = parseMcpAgentReview(environment.REA_MCP_REVIEW_AFTER_ANALYSIS);
+  if (!review.ok) throw review.error;
+  return createToolResultDelivery(configured.value, review.value);
 };
 
 const outputSchemasOmitted = (

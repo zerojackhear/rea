@@ -23,7 +23,7 @@ export const RIZIN_DEBUG_TOOL_CONTRACTS = [
     ...toolContractMetadata("start_rizin_debug_session"),
     kind: "native-provider",
     description:
-      "Start a persistent Rizin debugger session using `-N` to suppress user settings and scripts while retaining plugins, `-0` for NUL framing, and `-d` with an optional caller-selected IO debugger backend. Requires a caller-selected Linux TTY for inferior stdout and stderr; the target may write directly to that terminal while running and after detach. REA verifies both destinations and `dbg.exitkills=false` before detaching. Backend and target capabilities depend on the installed build. The session lives in this REA MCP process. Persistent sessions require Linux `/proc` descriptor readback. In a shared MCP server, starting this session retires any active binary-analysis session; after target effects have settled, call open_binary before further analysis. Close an active Ghidra session explicitly first.",
+      "Start a persistent Rizin debugger session using `-N` to suppress user settings and scripts while retaining plugins, `-0` for NUL framing, and `-d`. On Linux, inferior_tty selects a durable TTY and backend may select an IO debugger. On Windows x64, select an existing local NTFS output file and the native backend; a Rizin build with dbg.windows.stdio support and the matching REA native authority are required. The target may keep writing after detach; Windows appends without creating or truncating the file. REA verifies actual stdout/stderr destinations, process identity and dbg.exitkills=false; Windows additionally confirms kernel debugger detachment. The session lives in this REA MCP process. In a shared MCP server, starting this session retires any active binary-analysis session; after target effects have settled, call open_binary before further analysis. Close an active Ghidra session explicitly first.",
     inputSchema: z.strictObject({
       path: localPathStringSchema,
       inferior_tty: localPathStringSchema,
@@ -95,7 +95,7 @@ export const RIZIN_DEBUG_TOOL_CONTRACTS = [
     ...toolContractMetadata("close_rizin_debug_session"),
     kind: "native-provider",
     description:
-      "Close the REA-owned Rizin debugger only after verifying no inferior remains or detaching one with a verified caller-selected TTY output sink. A detached target may continue running and write to that TTY; target state is otherwise reported as unknown. REA never signals an inferior based on PID or path. In a shared MCP server, this admitted close retires any active binary-analysis session; after target effects have settled, call open_binary before further analysis. Close an active Ghidra session explicitly first.",
+      "Close the REA-owned Rizin debugger only after verifying no inferior remains or detaching one with a verified caller-selected output sink (Linux TTY or Windows local NTFS file). A detached target may continue running and writing; target state is otherwise reported as unknown. REA never signals an inferior based on PID or path. In a shared MCP server, this admitted close retires any active binary-analysis session; after target effects have settled, call open_binary before further analysis. Close an active Ghidra session explicitly first.",
     inputSchema: z.strictObject({ session_id: sessionId }),
     outputSchema: z.strictObject({ target_state: z.literal("unknown") }),
     examples: [

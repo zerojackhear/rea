@@ -2,11 +2,11 @@
 
 `decode_signal_recording` answers what a selected protocol decoder observes in
 an existing recording. It uses caller-supplied **sigrok-cli 0.7.2** with
-libsigrokdecode on **Linux**. util-linux `prlimit` is required (default
-`/usr/bin/prlimit`, overridable with absolute `REA_SIGROK_PRLIMIT_COMMAND`).
-The limiter sets soft and hard address-space limits before the decoder starts.
-macOS and Windows are refused because this adapter cannot enforce that limit on
-those hosts. It does not acquire samples or communicate with hardware.
+libsigrokdecode on **Linux or Windows x64**. Linux requires util-linux `prlimit`
+(default `/usr/bin/prlimit`, overridden by `REA_SIGROK_PRLIMIT_COMMAND`).
+Windows runs native sigrok-cli inside an owned Job Object; WSL and acquisition
+drivers are not required. macOS remains unsupported. This path does not acquire
+samples or communicate with hardware.
 
 ```sh
 export REA_SIGROK_COMMAND=/absolute/path/to/sigrok-cli
@@ -75,13 +75,19 @@ are trusted, and hashes identify bytes rather than publisher authenticity.
 The input copy is bounded at 32 MiB before reading, each command has a 30-second
 deadline, and combined stdout/stderr is bounded at 4 MiB during collection.
 Oversized output fails rather than becoming truncated success. These limits do
-not form an OS sandbox. Before execution, `prlimit` enforces **1 GiB address
+not form an OS sandbox. On Linux, before execution, `prlimit` enforces **1 GiB address
 space per process**, **64 MiB per file**, **30 CPU seconds** and no core dumps.
 Stricter inherited soft/hard limits are preserved; Evidence records the effective
 ceilings. Both limits are set before execution, so decoder allocations and compressed
 recording expansion cannot exceed the per-process address-space cap. These are
 not aggregate process-memory or filesystem quotas. The selected limiter is
 trusted and its path, digest and arguments are retained in Evidence.
+
+On Windows, a 1 GiB committed-memory limit applies to the entire owned tool
+process tree. Evidence reports `windows-job-object` and `job_memory_bytes`;
+Linux address-space, per-file and CPU-time limits are explicitly null.
+Input, output and wall-clock limits remain enforced; no filesystem or network
+sandbox is provided.
 
 ## Verification
 
@@ -94,7 +100,7 @@ The verifier synthesizes a 9600-baud 8N1 UART VCD carrying `REA`, then checks
 actual CLI/MCP parity, advertised schemas, stored Evidence, source hashes,
 annotation filtering/autodetection, invalid decoder/input failures and cleanup.
 An optional positional REA entrypoint verifies an installed package.
-The real-tool lane requires Linux, sigrok-cli 0.7.2 and libsigrokdecode. A separate
+The real-tool lane supports Linux and Windows x64 with sigrok-cli 0.7.2 and libsigrokdecode. A separate
 kernel-limit regression checks the inherited soft/hard limits and verifies an
 oversized allocation is refused before it can consume memory. Other formats,
 decoders and physical acquisition are not established by the UART fixture.

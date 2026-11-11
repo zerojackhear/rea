@@ -4,7 +4,8 @@ import { open, mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setImmediate, setTimeout as delay } from "node:timers/promises";
-import type { IPty } from "@lydell/node-pty";
+import type { ProcessCaptureTerminal } from "./ProcessCaptureTerminal.js";
+import { WindowsPtyProcess } from "../../windows/WindowsPtyProcess.js";
 
 import type { ProcessCapture } from "../../domain/process/processCaptureParsing.js";
 import type { ProcessScenario } from "../../domain/process/processScenario.js";
@@ -69,7 +70,10 @@ import type {
 } from "../../domain/process/processCapture.js";
 import { partialProcessCaptureObservationSchema } from "../../domain/process/processCapture.js";
 interface TerminalExitOptions {
-  readonly terminal: Pick<IPty, "onExit" | "kill">;
+  readonly terminal: Pick<
+    ProcessCaptureTerminal,
+    "onExit" | "kill" | "onFailure"
+  >;
   readonly scenario: ProcessScenario;
   readonly started: number;
   readonly lastOutput: () => number;
@@ -346,6 +350,12 @@ export const buildCaptureResult = (
           ]
         : []),
       "Process trees are sampled and may omit short-lived descendants.",
+      ...(options.manifest.pty_backend === "windows-conpty"
+        ? [
+            "Windows process samples contain handle-bound image paths, not command-line arguments; POSIX process-group and session IDs are unavailable. Cleanup uses the retained Job Object.",
+            "Windows SIGKILL requests force-terminate the retained root process; POSIX SIGTERM is unavailable and finalization records it as unverified before escalation. ConPTY merges stdout and stderr.",
+          ]
+        : []),
       ...(options.samplingPartial
         ? ["Process-tree sampling ended with an incomplete observation."]
         : []),
@@ -629,6 +639,7 @@ export const createRunManifest = async (
     platform: process.platform,
     architecture: process.arch,
   },
+  backend: UnverifiedProcessCapture["manifest"]["pty_backend"] = "node-pty",
 ): Promise<UnverifiedProcessCapture["manifest"]> => {
   const scenarioCommitment = processScenarioCommitment(
     scenario,
@@ -640,7 +651,7 @@ export const createRunManifest = async (
     provider_version: PROCESS_PROVIDER.version,
     platform: host.platform,
     architecture: host.architecture,
-    pty_backend: "node-pty",
+    pty_backend: backend,
     started_at: startedAt.toISOString(),
     completed_at: completedAt.toISOString(),
     scenario: scenarioCommitment,
@@ -665,12 +676,37 @@ export const observeSettlement = async (
   platform: NodeJS.Platform = process.platform,
   signal?: AbortSignal,
   onLiveProgress?: () => void,
+  terminal?: Pick<ProcessCaptureTerminal, "pid">,
 ): Promise<ObservedProcessSettlement> => {
   assertNotCancelled(signal);
   onLiveProgress?.();
   if (platform === "win32") {
+    const started = monotonicProcessCaptureClock();
+    let state: ObservedProcessSettlement["state"] = "unverifiable";
+    if (terminal instanceof WindowsPtyProcess) {
+      while (true) {
+        assertNotCancelled(signal);
+        onLiveProgress?.();
+        if (terminal.activeProcesses() === 0) {
+          state = "quiesced";
+          break;
+        }
+        if (monotonicProcessCaptureClock() - started >= settleMs) {
+          state = "alive_at_deadline";
+          break;
+        }
+        await delay(
+          Math.min(
+            25,
+            Math.max(1, settleMs - (monotonicProcessCaptureClock() - started)),
+          ),
+          undefined,
+          { signal },
+        );
+      }
+    }
     recordEvent("lifecycle", 1);
-    return { state: "unverifiable", elapsed_ms: 0 };
+    return { state, elapsed_ms: monotonicProcessCaptureClock() - started };
   }
   const started = monotonicProcessCaptureClock();
   let consecutiveEmpty = 0;
@@ -761,7 +797,7 @@ export const awaitTerminalExit = async ({
   recordEvent,
   onLiveProgress,
 }: TerminalExitOptions): Promise<TerminalExitResult> =>
-  new Promise((resolveExit) => {
+  new Promise((resolveExit, rejectExit) => {
     // The kill caused by a deadline is observed later as an ordinary PTY exit.
     // Keep the initiating lifecycle reason so comparisons distinguish a target
     // exit from harness-owned timeout, idle-timeout, and cancellation cleanup.
@@ -776,6 +812,23 @@ export const awaitTerminalExit = async ({
     let escalationSent = false;
     let settled = false;
     let exitObserved = false;
+    let failureListener: { dispose(): void } | undefined;
+    const failExit = (cause: unknown): void => {
+      if (settled) return;
+      settled = true;
+      for (const timer of timers) timer.cancel();
+      timers.clear();
+      failureListener?.dispose();
+      rejectExit(cause);
+    };
+    failureListener = terminal.onFailure?.(failExit);
+    const killRoot = (): void => {
+      try {
+        terminal.kill("SIGKILL");
+      } catch (cause: unknown) {
+        failExit(cause);
+      }
+    };
     const finalizationSignals: {
       signal: FinalizationSignal;
       sent_at_ms: number;
@@ -798,6 +851,7 @@ export const awaitTerminalExit = async ({
       settled = true;
       for (const timer of timers) timer.cancel();
       timers.clear();
+      failureListener?.dispose();
       resolveExit({
         unobserved: true,
         reason: reason === "exited" ? "timeout" : reason,
@@ -876,11 +930,11 @@ export const awaitTerminalExit = async ({
         attempt("SIGKILL");
         return;
       }
-      terminal.kill("SIGKILL");
+      killRoot();
     };
     const terminateAtDeadline = (): void => {
       if (scenario.finalization_ms === 0) {
-        terminal.kill("SIGKILL");
+        killRoot();
         return;
       }
       finalizationStartedAt = monotonicProcessCaptureClock();
@@ -924,6 +978,7 @@ export const awaitTerminalExit = async ({
       const finish = (): void => {
         if (settled) return;
         settled = true;
+        failureListener?.dispose();
         resolveExit({
           ...exit,
           reason,
@@ -1086,7 +1141,7 @@ const releaseCapturedProcessGroup = async (
 
 export interface ProcessCaptureResourceCleanupOptions {
   readonly timers: ReadonlySet<ProcessTimer>;
-  readonly terminal: Pick<IPty, "pid"> | undefined;
+  readonly terminal: Pick<ProcessCaptureTerminal, "pid"> | undefined;
   readonly renderer: TerminalRenderer | undefined;
   readonly runId: string;
   readonly temporaryRoot: string;
@@ -1160,6 +1215,13 @@ class ProcessCaptureResourceOwner {
       this.#ownedProcessGroup?.state === "not_required"
     )
       return;
+    if (this.options.terminal instanceof WindowsPtyProcess) {
+      const result = await this.options.terminal.cleanup();
+      this.#ownedProcessGroup = result.cleaned
+        ? { state: "cleaned", reason: null }
+        : { state: "unverified", reason: result.reason };
+      return;
+    }
     this.#ownedProcessGroup = await releaseCapturedProcessGroup(
       {
         runId: this.options.runId,
@@ -1303,7 +1365,7 @@ export const cleanupReportFailure = (
 };
 
 export const captureTerminalFrames = (options: {
-  readonly terminal: IPty;
+  readonly terminal: ProcessCaptureTerminal;
   readonly scenario: ProcessScenario;
   readonly frames: TerminalFrame[];
   readonly started: number;

@@ -1,5 +1,8 @@
 import { readFile } from "node:fs/promises";
 
+import { WindowsOwnedProcess } from "../windows/WindowsOwnedProcess.js";
+import { readWindowsProcessStartTime } from "../windows/WindowsDebuggerObservation.js";
+
 import { parseLinuxProcessStartTime } from "./ProcessOwnershipObservation.js";
 
 /** Result of terminating one debugger process owned by this application. */
@@ -46,7 +49,9 @@ const readLinuxProcessStartTime: ProcessStartTimeReader = async (pid) => {
 /** Confirm only that every previously identified inferior process has ended. */
 export const verifyOwnedInferiorsEnded = async (
   identities: Iterable<OwnedInferiorIdentity>,
-  readStartTime: ProcessStartTimeReader = readLinuxProcessStartTime,
+  readStartTime: ProcessStartTimeReader = process.platform === "win32"
+    ? readWindowsProcessStartTime
+    : readLinuxProcessStartTime,
 ): Promise<boolean> => {
   let foundIdentity = false;
   for (const identity of identities) {
@@ -129,7 +134,7 @@ interface OwnedDebuggerProcess {
   readonly detachInferior?: () => Promise<OwnedDebuggerDetachResult>;
   readonly supervisor: {
     waitForExit(timeoutMs: number): Promise<boolean>;
-    /** WindowsOwnedProcess closes output only after the whole Job Object settles. */
+    /** Close is observed only after the native owner's verified release. */
     waitForOutputClose(timeoutMs: number): Promise<boolean>;
     unrefOutputStreams(): void;
     /** Cap bytes retained after debugger shutdown while continuing to drain. */
@@ -145,6 +150,9 @@ const finishExitedDebuggerSession = async (
   status: "stopped" | "already_exited",
 ): Promise<OwnedDebuggerStopResult> => {
   try {
+    const owned = session.launched.process;
+    if (owned instanceof WindowsOwnedProcess && owned.debuggerLeaderOnly)
+      owned.confirmDebuggerDisposition();
     session.supervisor.limitAdditionalOutputBytes(
       MAX_LATE_DEBUGGER_OUTPUT_BYTES,
     );
@@ -210,7 +218,13 @@ export const stopOwnedDebuggerProcess = async (
       "already_exited",
     );
   }
-  if (platform === "win32")
+  if (
+    platform === "win32" &&
+    !(
+      session.launched.process instanceof WindowsOwnedProcess &&
+      session.launched.process.debuggerLeaderOnly
+    )
+  )
     return {
       status: "incomplete",
       reason: `Owned ${debuggerName} process cannot be stopped safely on Windows because job termination can also terminate its inferior processes.`,
@@ -240,6 +254,11 @@ export const stopOwnedDebuggerProcess = async (
       };
     }
     detachOutcomes.set(session, "confirmed");
+    if (
+      session.launched.process instanceof WindowsOwnedProcess &&
+      session.launched.process.debuggerLeaderOnly
+    )
+      session.launched.process.confirmDebuggerDisposition();
   } catch (cause: unknown) {
     return {
       status: "incomplete",

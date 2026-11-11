@@ -1,3 +1,7 @@
+import {
+  artifactCommandLimiterSchema,
+  artifactCommandLimitsSchema,
+} from "../artifactCommandLimits.js";
 import { z } from "zod";
 import { fixedTupleSchema } from "../fixedTupleSchema.js";
 import { localPathStringSchema } from "../localPath.js";
@@ -130,20 +134,8 @@ export const packetCaptureSchema = z
       arguments: z.array(z.string()),
     }),
     configuration: z.literal("private-empty-personal-profile"),
-    resource_limiter: z.strictObject({
-      configured_path: z.string(),
-      path: z.string(),
-      sha256: z.string().regex(/^[a-f0-9]{64}$/),
-      arguments: z.array(z.string()),
-    }),
-    limits: z.strictObject({
-      input_bytes: z.number().int().positive(),
-      output_bytes: z.number().int().positive(),
-      command_timeout_ms: z.number().int().positive(),
-      address_space_bytes: z.number().int().nonnegative(),
-      file_bytes: z.number().int().nonnegative(),
-      cpu_seconds: z.number().int().nonnegative(),
-    }),
+    resource_limiter: artifactCommandLimiterSchema,
+    limits: artifactCommandLimitsSchema,
     hardware_acquisition: z.literal("not-performed"),
   })
   .superRefine((report, context) => {

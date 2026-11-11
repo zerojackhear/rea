@@ -98,6 +98,17 @@ export const pwntoolsDecoderFailure = (
         PWNTOOLS_LIMITS.timeoutMs,
         outputOptions,
       );
+    if (cause.snapshot?.memoryLimitReached === true)
+      return new AnalysisResourceConstraintError(
+        context.operation,
+        "memory",
+        "Owned Windows Python reached its Job Object committed-memory limit.",
+        {
+          kind: "windows-job-object",
+          job_memory_bytes: PWNTOOLS_LIMITS.addressSpaceBytes,
+        },
+        outputOptions,
+      );
     if (cause.reason === "output-limit")
       return new AnalysisOutputError(
         context.operation,

@@ -1,0 +1,108 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -80,7 +80,7 @@
+ 
+     set(USE_VECTORSCAN FALSE)
+     set(HYPERSCAN_VERSION 5.4.2)
+-    set(HYPERSCAN_TAG v5.4.2)
++    set(HYPERSCAN_TAG bc3b191ab56055e8560c7cdc161c289c4d76e3d2)
+     set(HYPERSCAN_REPO https://github.com/intel/hyperscan.git)
+     message(STATUS "Using Hyperscan ${HYPERSCAN_VERSION} from ${HYPERSCAN_REPO}")
+   else()
+@@ -166,65 +166,9 @@
+   hs_locate_ragel(VERSION "6.9")
+ 
+   if(NOT RAGEL_FOUND)
+-    # Build and install Ragel if necessary
+-    if(WIN32)
+-      # if Windows, expect MSYS2 to be installed at C:/msys64 or abort
+-      # this should be the case on Windows Server GitHub Actions runners
+-      # simply use the MSYS2/MinGW package for ragel since we just need
+-      # the binary
+-      if(NOT EXISTS C:/msys64)
+-        message(FATAL_ERROR "MSYS2 not found at C:/msys64")
+-      endif()
+-
+-      set(BASH_PATH C:/msys64/usr/bin/bash.exe)
+-      execute_process(
+-        COMMAND ${BASH_PATH} -c "/usr/bin/pacman -Syuu --noconfirm"
+-        RESULT_VARIABLE MSYS2_UPDATE_RESULT
+-      )
+-
+-      if(MSYS2_UPDATE_RESULT)
+-        message(FATAL_ERROR "Failed to update MSYS2 packages")
+-      endif()
+-
+-      execute_process(
+-        COMMAND ${BASH_PATH} -c "/usr/bin/pacman -S --noconfirm mingw-w64-x86_64-ragel"
+-        RESULT_VARIABLE MSYS2_RAGEL_INSTALL_RESULT
+-      )
+-
+-      if(MSYS2_RAGEL_INSTALL_RESULT)
+-        message(FATAL_ERROR "Failed to install ragel")
+-      endif()
+-
+-      set(RAGEL_EXECUTABLE C:/msys64/mingw64/bin/ragel.exe CACHE PATH "Ragel executable" FORCE)
+-      set(RAGEL ${RAGEL_EXECUTABLE})
+-      set(RAGEL_FOUND TRUE)
+-      message(STATUS "Ragel executable: ${RAGEL_EXECUTABLE}")
+-    else()
+-      # prerequisites (in addition to a build toolchain): autoconf, kelbt
+-      find_program(AUTORECONF autoreconf REQUIRED)
+-      find_program(KELBT kelbt REQUIRED)
+-      ExternalProject_Add(
+-        ragel
+-        GIT_REPOSITORY ${RAGEL_REPO}
+-        GIT_TAG ragel-${RAGEL_VERSION}
+-        BUILD_IN_SOURCE TRUE
+-        CONFIGURE_COMMAND ${AUTORECONF} -f -i
+-        COMMAND ./configure --prefix=${CMAKE_BINARY_DIR} --disable-manual
+-        BUILD_COMMAND make -j4
+-        INSTALL_COMMAND ""
+-      )
+-      set(RAGEL_EXECUTABLE ${ragel_BINARY_DIR}/bin/ragel CACHE PATH "Ragel executable" FORCE)
+-      set(RAGEL_VERSION ${RAGEL_VERSION})
+-      set(RAGEL_FOUND TRUE)
+-      set(RAGEL_FOUND TRUE)
+-      message(STATUS "Ragel executable: ${RAGEL_EXECUTABLE}")
+-      add_custom_target(ragel COMMAND ${RAGEL_EXECUTABLE} -V)
+-    endif()
+-  else()
+-    set(RAGEL_EXECUTABLE ${RAGEL_EXECUTABLE})
+-    add_custom_target(ragel COMMAND ${RAGEL_EXECUTABLE} -V)
+-    message(STATUS "Ragel executable: ${RAGEL_EXECUTABLE}")
+-  endif()
++    message(FATAL_ERROR "A task-local Ragel is required; automatic installation is disabled")
++  endif()
++  add_custom_target(ragel COMMAND "${RAGEL_EXECUTABLE}" -V)
+ 
+   set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+ 
+@@ -240,7 +184,7 @@
+     # Ensure consistent MSVC runtime flags
+     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
+ 
+-    set(HS_CMAKE_COMMON_FLAGS "/arch:SSE2 /FS /GS-")
++    set(HS_CMAKE_COMMON_FLAGS "/arch:SSE2 /FS /GS")
+ 
+     if(NOT CMAKE_BUILD_PARALLEL_LEVEL)
+       set(CMAKE_BUILD_PARALLEL_LEVEL 2)
+@@ -532,7 +476,7 @@
+     CMAKE_ARGS ${HS_CMAKE_ARGS} -Wno-dev
+     CMAKE_CACHE_ARGS ${HS_CMAKE_CACHE_ARGS}
+     BUILD_BYPRODUCTS ${HS_BUILD_BYPRODUCTS}
+-    BUILD_COMMAND ${CMAKE_COMMAND} --build . --config Release --parallel 4 ${HS_TARGETS}
++    BUILD_COMMAND ${CMAKE_COMMAND} --build . --config Release --parallel 2 ${HS_TARGETS}
+   )
+   add_dependencies(${HS_EXT_NAME} libhs)
+ else()
+@@ -555,7 +499,8 @@
+ endif()
+ 
+ if(WIN32)
+-  target_compile_options(${HS_EXT_NAME} PRIVATE ${HS_CMAKE_COMMON_FLAGS})
++  separate_arguments(HS_EXT_FLAGS NATIVE_COMMAND "${HS_CMAKE_COMMON_FLAGS}")
++  target_compile_options(${HS_EXT_NAME} PRIVATE ${HS_EXT_FLAGS})
+ else()
+   # Hide all symbols by default to prevent conflicts with other C++ extensions
+   # (e.g., numpy, scipy, sklearn) that may use the same C++ runtime symbols

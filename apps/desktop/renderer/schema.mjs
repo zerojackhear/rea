@@ -67,6 +67,11 @@ export function fieldType(schema) {
 export function defaultFieldValue(schema) {
   if (!Object.hasOwn(schema, "default")) return "";
   const type = fieldType(schema);
+  // Scalar controls cannot represent null. Leave an untouched null default
+  // omitted so the tool applies its declared default, rather than inventing
+  // the string "null" or feeding it into a number/boolean control. Explicit
+  // caller-selected null remains lossless in JSON mode.
+  if (schema.default === null && type !== "json") return "";
   return type === "json"
     ? JSON.stringify(schema.default, null, 2)
     : String(schema.default);

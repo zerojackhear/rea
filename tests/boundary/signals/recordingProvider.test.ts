@@ -3,6 +3,7 @@ import { OwnedCommandFailure } from "../../../src/process/OwnedCommand.js";
 import { it, expect, onTestFinished } from "vitest";
 import { writeFile, readdir, chmod, symlink } from "node:fs/promises";
 import { join } from "node:path";
+import { ArtifactReaderFailure } from "../../../src/artifacts/ArtifactReader.js";
 import { readStableArtifact } from "../../../src/artifacts/readStableArtifact.js";
 import { SigrokRecordingProvider } from "../../../src/signals/SigrokRecordingProvider.js";
 import { SignalRecordingService } from "../../../src/application/signals/SignalRecordingService.js";
@@ -42,6 +43,14 @@ else { if(readFileSync('recording', 'utf8') !== 'recording bytes') throw Error('
   const configuredCommand =
     mode === "symlink" ? join(directory, "configured-tool") : script;
   if (mode === "symlink") await symlink(script, configuredCommand);
+  const limiterFailure = mode === "limiter-io" || mode === "limiter-limit";
+  const configuredLimiter = limiterFailure
+    ? join(directory, "limiter.mjs")
+    : configuredCommand;
+  if (limiterFailure) {
+    await writeFile(configuredLimiter, "// separate trusted limiter fixture");
+    await chmod(configuredLimiter, 0o700);
+  }
   const controller = new AbortController();
   let calls = 0;
   let mayClean = !failCleanup;
@@ -51,7 +60,7 @@ else { if(readFileSync('recording', 'utf8') !== 'recording bytes') throw Error('
     {
       ...process.env,
       REA_SIGROK_COMMAND: configuredCommand,
-      REA_SIGROK_PRLIMIT_COMMAND: configuredCommand,
+      REA_SIGROK_PRLIMIT_COMMAND: configuredLimiter,
     },
     async (input) => {
       calls++;
@@ -109,6 +118,11 @@ else { if(readFileSync('recording', 'utf8') !== 'recording bytes') throw Error('
         await truncate(script, 64 * 1024 * 1024 + 1);
       }
       if (mode === "post-run-abort" && calls === 2) controller.abort();
+      if (limiterFailure && calls === 2 && args[0] === configuredLimiter)
+        throw new ArtifactReaderFailure(
+          mode === "limiter-io" ? "io" : "limit",
+          "Limiter verification fixture refusal",
+        );
       return readStableArtifact(...args);
     },
     async (limits) => ({ ...limits, file_bytes: 1048576 }),
@@ -122,6 +136,7 @@ else { if(readFileSync('recording', 'utf8') !== 'recording bytes') throw Error('
   return {
     service,
     directory,
+    configuredLimiter,
     path,
     controller,
     calls: () => calls,
@@ -132,6 +147,33 @@ else { if(readFileSync('recording', 'utf8') !== 'recording bytes') throw Error('
     },
   };
 };
+
+it.each(["limiter-io", "limiter-limit"])(
+  "attributes %s to the limiter and retains producer output",
+  async (mode) => {
+    const f = await fixture(mode);
+    const result = await f.service.decode({ path: f.path, decoders: "uart" });
+    if (result.ok) throw new Error("Expected limiter verification refusal");
+    expect(result.error).toMatchObject(
+      mode === "limiter-io"
+        ? {
+            _tag: "ProviderAdapterError",
+            diagnostics: {
+              stage: "integrity",
+              resource_path: f.configuredLimiter,
+            },
+          }
+        : { _tag: "AnalysisArtifactChangedError", path: f.configuredLimiter },
+    );
+    expect(result.error.capturedOutput?.stderr).toBe("producer warning\n");
+    expect(result.error.capturedOutput?.stdout).not.toBe("");
+    expect(
+      (await readdir(f.directory)).filter((name) =>
+        name.startsWith("decoder-"),
+      ),
+    ).toEqual([]);
+  },
+);
 
 it("refuses new acquisition after provider shutdown", async () => {
   const f = await fixture();

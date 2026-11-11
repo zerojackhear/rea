@@ -83,6 +83,14 @@ export const evmInterfaceFailure = (
         cause.message,
         outputOptions,
       );
+    if (cause.snapshot?.memoryLimitReached === true)
+      return new AnalysisResourceConstraintError(
+        "inspect_evm_interface",
+        "memory",
+        "The owned Windows worker tree reached its Job Object commit limit.",
+        { job_memory_bytes: EVM_INTERFACE_LIMITS.addressSpaceBytes },
+        outputOptions,
+      );
     if (
       cause.reason === "process" &&
       (cause.snapshot?.signal === "SIGXCPU" ||
@@ -118,7 +126,7 @@ export const evmInterfaceFailure = (
     typeof cause.syscall === "string" &&
     cause.syscall.startsWith("spawn ")
   ) {
-    const reason = `Configured util-linux prlimit could not launch (${String(cause.code)}): ${limiter}. Check its executable/interpreter and host execute access.`;
+    const reason = `Configured owned worker command could not launch (${String(cause.code)}): ${limiter}. Check its executable/interpreter and host execute access.`;
     return new AnalysisCapabilityUnavailableError(
       EVMOLE_PROVIDER_IDENTITY.id,
       "inspect_evm_interface",

@@ -1,0 +1,163 @@
+--- a/src/print.c
++++ b/src/print.c
+@@ -315,7 +315,8 @@
+ 
+ 	if (flags & FILE_T_WINDOWS) {
+ 		struct timespec ts;
+-		cdf_timestamp_to_timespec(&ts, CAST(cdf_timestamp_t, v));
++		if (cdf_timestamp_to_timespec(&ts, CAST(cdf_timestamp_t, v)) == -1)
++			goto out;
+ 		t = ts.tv_sec;
+ 	} else {
+ 		// XXX: perhaps detect and print something if overflow
+@@ -323,6 +324,11 @@
+ 		t = CAST(time_t, v);
+ 	}
+ 
++	/* Windows CRT rejects negative timestamps through a fatal handler. */
++#ifdef WIN32
++	if (t < 0)
++		goto out;
++#endif
+ 	if (t > MAX_CTIME)
+ 		goto out;
+ 
+@@ -355,13 +361,19 @@
+ 	struct tm tm;
+ 
+ 	memset(&tm, 0, sizeof(tm));
+-	tm.tm_mday = v & 0x1f;
+-	tm.tm_mon = ((v >> 5) & 0xf) - 1;
+-	// Sanity check because some OS's coredump with invalid values.
+-	// Yes, Cygwin I am looking at you!
+-	if (tm.tm_mon < 0 || tm.tm_mon > 11)
+-		tm.tm_mon = 0;
+-	tm.tm_year = (v >> 9) + 80;
++	const unsigned day = v & 0x1f;
++	const unsigned month = (v >> 5) & 0xf;
++	const unsigned year = (v >> 9) + 1980;
++	static const unsigned month_days[] = {31,28,31,30,31,30,31,31,30,31,30,31};
++	/* Reject malformed source coordinates before the Windows CRT formatter.
++	 * Do not silently turn an invalid source month into January. */
++	if (month < 1 || month > 12 || day < 1 ||
++	    day > month_days[month - 1] + (month == 2 &&
++	        (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0))))
++		goto out;
++	tm.tm_mday = day;
++	tm.tm_mon = month - 1;
++	tm.tm_year = year - 1900;
+ 
+ 	if (strftime(buf, bsize, "%b %d %Y", &tm) == 0)
+ 		goto out;
+@@ -381,8 +393,11 @@
+ 	tm.tm_sec = (v & 0x1f) * 2;
+ 	tm.tm_min = ((v >> 5) & 0x3f);
+ 	tm.tm_hour = (v >> 11);
+-
+-	if (strftime(buf, bsize, "%T", &tm) == 0)
++	if (tm.tm_sec > 59 || tm.tm_min > 59 || tm.tm_hour > 23)
++		goto out;
++	tm.tm_mday = 1; /* A complete valid struct tm for strict CRTs. */
++
++	if (strftime(buf, bsize, "%H:%M:%S", &tm) == 0)
+ 		goto out;
+ 
+ 	return buf;
+--- a/src/file.h
++++ b/src/file.h
+@@ -52,7 +52,12 @@
+ #define __STDC_FORMAT_MACROS
+ #endif
+ 
+-#ifdef _WIN32
++#if defined(__MINGW32__)
++/* These are format length modifiers; PRI macros already include a conversion. */
++# define SIZE_T_FORMAT "z"
++# define INT64_T_FORMAT "ll"
++# define INTMAX_T_FORMAT "j"
++#elif defined(_WIN32)
+ # ifdef PRIu32
+ #  ifdef _WIN64
+ #   define SIZE_T_FORMAT PRIu64
+@@ -169,8 +174,13 @@
+  * implementations like muslc crash otherwise. If you are unlucky
+  * to be running on a system with a 32 bit time_t, then it is even less.
+  */
++#ifdef WIN32
++/* The Windows CRT supports dates only through the end of year 3000. */
++#define MAX_CTIME CAST(time_t, sizeof(time_t) > 4 ? 32535215999ULL : 0x7fffffffULL)
++#else
+ #define	MAX_CTIME \
+     CAST(time_t, sizeof(time_t) > 4 ? 0x3afff487cfULL : 0x7fffffffULL)
++#endif
+ 
+ #define FILE_BADSIZE CAST(size_t, ~0ul)
+ #define MAXDESC	64		/* max len of text description/MIME type */
+--- a/src/cdf_time.c
++++ b/src/cdf_time.c
+@@ -122,6 +122,10 @@
+ 
+ 	if (tm.tm_year > 9999)
+ 		goto out;
++#ifdef WIN32
++	if (tm.tm_year < 1970 || tm.tm_year > 3000)
++		goto out;
++#endif
+ 
+ 	rdays = cdf_getdays(tm.tm_year);
+ 	t -= rdays - 1;
+@@ -137,8 +141,12 @@
+ 	tm.tm_zone = UTC;
+ #endif
+ 	tm.tm_year -= 1900;
+-	ts->tv_sec = mktime(&tm);
+-	if (ts->tv_sec == -1)
++	const time_t seconds = mktime(&tm);
++	if (seconds == (time_t)-1)
++		goto out;
++	ts->tv_sec = seconds;
++	/* Some MinGW timespec layouts have a narrower tv_sec than time_t. */
++	if ((time_t)ts->tv_sec != seconds)
+ 		goto out;
+ 	return 0;
+ out:
+@@ -172,16 +180,15 @@
+ file_protected char *
+ cdf_ctime(const time_t *sec, char *buf)
+ {
+-	char *ptr = *sec > MAX_CTIME ? NULL : ctime_r(sec, buf);
++	int invalid = *sec > MAX_CTIME;
++#ifdef WIN32
++	invalid = invalid || *sec < 0;
++#endif
++	char *ptr = invalid ? NULL : ctime_r(sec, buf);
+ 	if (ptr != NULL)
+ 		return buf;
+-#ifdef WIN32
+-	(void)snprintf(buf, 26, "*Bad* 0x%16.16I64x\n",
+-	    CAST(long long, *sec));
+-#else
+ 	(void)snprintf(buf, 26, "*Bad* %#16.16" INT64_T_FORMAT "x\n",
+ 	    CAST(long long, *sec));
+-#endif
+ 	return buf;
+ }
+ 
+--- a/src/readcdf.c
++++ b/src/readcdf.c
+@@ -240,8 +240,13 @@
+ 						return -1;
+ 				} else {
+ 					char *c, *ec;
+-					cdf_timestamp_to_timespec(&ts, tp);
+-					c = cdf_ctime(&ts.tv_sec, tbuf);
++					if (cdf_timestamp_to_timespec(&ts, tp) == -1) {
++						strlcpy(tbuf, "*Invalid datetime*", sizeof(tbuf));
++						c = tbuf;
++					} else {
++						const time_t seconds = ts.tv_sec;
++						c = cdf_ctime(&seconds, tbuf);
++					}
+ 					if (c != NULL &&
+ 					    (ec = strchr(c, '\n')) != NULL)
+ 						*ec = '\0';

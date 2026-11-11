@@ -8,7 +8,7 @@ PSP loading and calling conventions remain owned by
 
 ## Initial boundary
 
-The initial profile is limited to Linux x64, little-endian ELF32 `ET_EXEC`,
+The profile supports Windows x64 and Linux x64 hosts with little-endian ELF32 `ET_EXEC`,
 `EM_MIPS` and the PSPSDK declaration `e_flags=0x10a23001`. Those bits declare
 MIPS II, Allegrex, EABI32 and NOREORDER; they are not proof of every instruction's
 semantics. The profile also requires an inspected version-0 MIPS ABI flags
@@ -68,9 +68,40 @@ including extension content identity. It also carries the VFPU and static-only
 limitations. The extension does not model VFPU prefix effects completely;
 nonempty decompiled code is not proof of correct vector behavior. Existing
 session-local metadata editing does not change executable bytes or turn a
-snapshot into a persistent Ghidra project.
+snapshot into a persistent Ghidra project. Windows keeps the read-only P0
+boundary: this processor profile adds no annotation or target-execution authority.
 
 ## Verification
+
+Windows verification uses Ghidra **12.1.4**, an unmodified **v21.4** Allegrex
+source build (`8d5ca58e609ad7e732d550036126b6b0f99bd663`), JDK 21 and
+the native REA process/filesystem controls. The sample generation step uses
+PSPDEV v20261001 independently; it does not execute the sample. No Linux
+process services a Windows analysis request.
+
+`scripts/verify-ghidra-psp-native.mjs` consumes two previously built fixtures
+under `a/` and `b/`, each with `rea_psp_fixture.elf` and the recorded
+`buildPspFixture` output in `generation.json` (including `executed_target: false`).
+It checks the fixture/source digests and independent GNU observations before
+public analysis. The generator uses global values 7 and 11 respectively.
+
+```powershell
+node scripts/verify-ghidra-psp-native.mjs --fixtures C:\proof\psp-fixtures --report C:\proof\windows-psp.json
+# Select a Ghidra installation without Allegrex for the rejection case:
+node scripts/verify-ghidra-psp-native.mjs --fixtures C:\proof\psp-fixtures --report C:\proof\windows-psp-missing.json --without-extension
+```
+
+Run this verifier under the existing native owned-command supervisor to retain
+positive whole-process-family cleanup evidence. Its report retains snapshots,
+input provenance and CLI/MCP results; it does not claim a global PID scan as
+proof of Windows process ownership.
+
+中文使用：选择 Windows 原生 Ghidra，并在该安装目录中放入与 Ghidra 版本匹配的
+Allegrex 扩展，即可通过同一套函数分析、指令、引用和字节读取工具分析静态 PSP ELF。
+可用它查看函数逻辑和调用关系；它不会启动 PSP 程序，也不把 PRX、PBP 或游戏镜像
+误当成已验证的 ELF 输入。
+
+### Original on-host fixture-building lane
 
 Use the existing real MIPS verifier with its PSP option. Required tools are
 caller-supplied `make`, `psp-config`, `psp-gcc`, `psp-readelf`, `psp-objdump`,

@@ -21,7 +21,13 @@ export class EngineBridge extends EventEmitter {
   #closing;
   #state = { connection: "connecting", toolsCount: 0 };
 
-  constructor({ node, engine, coreRoot, dataDir }) {
+  constructor({
+    node,
+    engine,
+    coreRoot,
+    dataDir,
+    environment = process.env,
+  }) {
     super();
     this.#child = fork(engine, [], {
       execPath: node,
@@ -29,7 +35,7 @@ export class EngineBridge extends EventEmitter {
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe", "ipc"],
       env: {
-        ...process.env,
+        ...environment,
         REA_DESKTOP_CORE_ROOT: coreRoot,
         REA_DESKTOP_DATA_DIR: dataDir,
       },

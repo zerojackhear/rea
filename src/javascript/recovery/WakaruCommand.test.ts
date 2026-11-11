@@ -170,3 +170,39 @@ it("honors cancellation while waiting for output after exit", async () => {
     producer.stderr.destroy();
   }
 });
+
+it("reports a Windows Job Object memory refusal even when the tool exits zero", async () => {
+  const { context } = commandFixture((producer) => {
+    Object.assign(producer, { memoryLimitReached: true });
+    producer.stdout.end("incomplete result");
+    producer.stderr.end();
+    producer.emit("exit", 0, null);
+    producer.emit("close", 0, null);
+  });
+  await expect(
+    runWakaruCommand({ ...context, limiter: null }),
+  ).rejects.toMatchObject({
+    _tag: "AnalysisResourceConstraintError",
+    resource: "memory",
+    reportedLimits: { job_memory_bytes: RECOVERY_LIMITS.addressSpaceBytes },
+    capturedOutput: {
+      stdout: "incomplete result",
+      stderr: "",
+      truncated: false,
+      exit_code: 0,
+    },
+  });
+});
+
+it("retains both complete diagnostic streams within their separate budgets", async () => {
+  const bytes = 5 * 1024 * 1024;
+  const { context } = commandFixture((producer) => {
+    producer.stdout.end(Buffer.alloc(bytes, 97));
+    producer.stderr.end(Buffer.alloc(bytes, 98));
+    producer.emit("exit", 0, null);
+    producer.emit("close", 0, null);
+  });
+  const result = await runWakaruCommand(context);
+  expect(result.stdout.length).toBe(bytes);
+  expect(result.stderr.length).toBe(bytes);
+});

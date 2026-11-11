@@ -26,8 +26,59 @@ The layout contains the fresh, completely verified Electron distribution and its
 
 The builder checks the packaged native artifact, actual SDK/node-pty/native module loads and the real CLI version. A sibling `.receipt.json` records source hashes, exact tools, checks, native manifest, output path and ZIP digest. `BUILD-INFO.json` inside the application records its versions and limitations. Source snapshots are rechecked before final output to detect edits during packaging.
 
-## Coverage
+## Windows analysis
+
+The desktop launches its bundled Windows core directly. Explicit provider paths
+select locally installed Windows tools. Caller-selected file paths, target
+identity, Evidence and cleanup ownership remain in the same native session.
+The desktop has no WSL launcher or cross-platform path rewriting.
+
+## Desktop coverage
+
+The tool list, global search and parameter panel include Chinese names, purposes,
+operation steps and prerequisites for the current engine catalog. Technical tool
+IDs and expandable original descriptions remain available. These presentation
+guides do not change tool schemas or provider authority. New unknown tool IDs
+explicitly fall back to the engine description until a guide is added; they are
+not assigned invented capabilities. Validate guide coverage against the live
+catalog when changing the packaged engine.
+
+The desktop entry points use named tools from the live catalog. Native files start
+with `open_binary` to identify the file and explicitly bind
+a target before session-based analysis such as `binary_overview`. Folder selection asks whether to choose a
+program inside it or analyze it as a JavaScript/Electron project. A directory name
+or a missing filename extension is not evidence of JavaScript content.
+
+For existing local providers, `%APPDATA%/REA Desktop/providers.json` may contain
+absolute path values for `GHIDRA_INSTALL_DIR`, `JAVA_HOME`, `REA_JADX_MCP_JAR`,
+`REA_WABT_BIN_DIRECTORY`, `REA_TSHARK_COMMAND`, `REA_CAPINFOS_COMMAND`,
+`REA_SIGROK_COMMAND`, `REA_WAKARU_COMMAND`, `REA_MITMDUMP_COMMAND`,
+`REA_BINWALK_COMMAND`, `REA_UNBLOB_COMMAND`, `REA_PWNTOOLS_PYTHON`,
+`REA_KUNA_COMMAND`, `REA_KUNA_CACHE_DIR`, `REA_GDB_COMMAND`,
+`REA_RIZIN_COMMAND`, and `REA_OBJDUMP_COMMAND`.
+Restart the app after editing. These explicit values
+override inherited values for the analysis child only. The desktop does not save
+the ambient environment, bundle this private file, install providers, or weaken
+their version/integrity admission checks. Missing configuration retains inherited
+settings; malformed configuration reports a startup error without deleting it.
 
 This is an unsigned REA development build, currently Windows x64 only, with no installer registration or auto-update. Module loading and CLI version checks do not establish interactive acceptance or coverage of all modules/providers. Verify the real packaged UI and relevant public CLI/MCP workflows separately. Optional Frida's native install step is intentionally not performed or claimed to work. Ghidra/JDK, IDA, Android tools and other external providers are not bundled or silently installed.
 
 Electron and Node are admitted by fixed complete-archive length/SHA-256 and fresh extraction, then executable SHA-256. These checks do not constitute a new independent signature verification. Their upstream license/notices and REA's LICENSE/THIRD_PARTY_NOTICES.md remain in the portable application.
+
+## Manual MCP agent handoff
+
+The Environment page contains **连接 MCP Agent** with a default-off
+**汇报后等待你确认** switch and **复制 MCP 连接配置**. Settings are stored in the
+Desktop user-data directory as `mcp-settings.json`; a changed existing setting
+is backed up before atomic replacement. Invalid settings are preserved and
+reported instead of silently reset. The renderer can only toggle this boolean,
+not choose configuration paths or executable arguments.
+
+The copied configuration launches this application's Windows REA core and
+runtime, includes only explicit provider paths, and sets
+`REA_MCP_REVIEW_AFTER_ANALYSIS`. It never edits another agent's configuration.
+Update and reconnect the external MCP client after changing the switch. That
+agent receives its own analysis results and the requested report-and-wait
+policy; enforcement of its next action belongs to the client. Desktop history
+and the external agent's REA session remain separate.

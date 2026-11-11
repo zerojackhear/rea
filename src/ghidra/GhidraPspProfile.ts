@@ -7,6 +7,15 @@ import {
 import { ghidraPowerPcUnsupportedReason } from "./GhidraPowerPcProfile.js";
 import { ghidraRiscvUnsupportedReason } from "./GhidraRiscvProfile.js";
 
+/** Host admission shared by target selection and extension resolution. */
+export const ghidraPspHostUnsupportedReason = (
+  platform: NodeJS.Platform,
+  architecture: NodeJS.Architecture,
+): string | null =>
+  (platform === "linux" || platform === "win32") && architecture === "x64"
+    ? null
+    : "The PSP Allegrex profile requires a supported Windows or Linux x64 Ghidra installation.";
+
 /** Allegrex's ELF machine declaration, not a filename or inferred instruction. */
 export const isGhidraPspTarget = (target: BinaryTarget): boolean =>
   target.kind === "executable" &&

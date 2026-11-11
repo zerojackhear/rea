@@ -1,0 +1,12 @@
+--- a/librz/core/cconfig.c
++++ b/librz/core/cconfig.c
+@@ -3459,6 +3459,9 @@
+ 	SETCB("dbg.follow.child", "false", &cb_dbg_follow_child, "Continue tracing the child process on fork. By default the parent process is traced");
+ 	SETCB("dbg.trace_continue", "true", &cb_dbg_trace_continue, "Trace every instruction between the initial PC position and the PC position at the end of continue's execution");
+ 	SETCB("dbg.create_new_console", "true", &cb_dbg_create_new_console, "Create a new console window for the debugee on debug start");
++#if __WINDOWS__
++	SETBPREF("dbg.windows.stdio", "false", "Route Windows inferior stdout/stderr to existing NTFS files with a private handle list");
++#endif
+ 	/* debug */
+ 	SETBPREF("dbg.status", "false", "Set cmd.prompt to '.dr*' or '.dr*;drd;sr PC;pi 1;shu'");
+ #if DEBUGGER

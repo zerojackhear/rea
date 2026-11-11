@@ -190,7 +190,7 @@ export const registerReverseEngineeringCommands = (
   });
   cli.command(CLI_COMMANDS.debugWithGdb, {
     description:
-      "Run one unrestricted GDB console command in an ephemeral MI session; provide an inferior TTY so a live target can be safely detached",
+      "Run one unrestricted GDB console command in an ephemeral MI session; select a durable Linux TTY or Windows output file for live-target detach",
     args: z.object({
       command: z
         .string()
@@ -202,7 +202,7 @@ export const registerReverseEngineeringCommands = (
         .string()
         .min(1)
         .describe(
-          "Caller-selected durable TTY for output from a live GDB inferior.",
+          "Caller-selected durable Linux TTY or existing Windows NTFS output file (may be truncated by GDB).",
         ),
     }),
     run: ({ args, options }) =>
@@ -299,7 +299,9 @@ export const registerReverseEngineeringCommands = (
       inferiorTty: z
         .string()
         .min(1)
-        .describe("Caller-selected Linux TTY for inferior stdout and stderr."),
+        .describe(
+          "Linux TTY or existing local NTFS file on Windows x64 for inferior stdout and stderr.",
+        ),
       backend: z
         .string()
         .min(1)

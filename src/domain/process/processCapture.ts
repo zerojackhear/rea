@@ -205,7 +205,7 @@ export interface UnverifiedProcessCapture {
     readonly provider_version: string;
     readonly platform: string;
     readonly architecture: string;
-    readonly pty_backend: "node-pty";
+    readonly pty_backend: "node-pty" | "windows-conpty";
     readonly started_at: string;
     readonly completed_at: string;
     readonly scenario: Readonly<Record<string, unknown>>;
@@ -455,7 +455,7 @@ const processCaptureShapeSchema = z.strictObject({
     provider_version: z.string().min(1),
     platform: z.string().min(1),
     architecture: z.string().min(1),
-    pty_backend: z.literal("node-pty"),
+    pty_backend: z.enum(["node-pty", "windows-conpty"]),
     started_at: utcDateTimeSchema,
     completed_at: utcDateTimeSchema,
     scenario: z.record(z.string(), jsonValueSchema),

@@ -9,20 +9,30 @@ import { z } from "zod";
 import { PWNTOOLS_LIMITS } from "./PwntoolsRelease.js";
 import type { ArtifactResourceScope } from "../../artifacts/ArtifactResourceScope.js";
 
-/** Actual limits reported by the owned bridge after lowering inherited soft limits. */
-export const pwntoolsResourceLimitsSchema = z.strictObject({
-  address_space_bytes: z
-    .number()
-    .int()
-    .nonnegative()
-    .max(PWNTOOLS_LIMITS.addressSpaceBytes),
-  cpu_seconds: z.number().int().nonnegative().max(PWNTOOLS_LIMITS.cpuSeconds),
-  file_size_bytes: z
-    .number()
-    .int()
-    .nonnegative()
-    .max(PWNTOOLS_LIMITS.outputBytes),
-});
+/** POSIX soft limits and owner-verified Windows job limits have different semantics. */
+export const pwntoolsResourceLimitsSchema = z.union([
+  z.strictObject({
+    address_space_bytes: z
+      .number()
+      .int()
+      .nonnegative()
+      .max(PWNTOOLS_LIMITS.addressSpaceBytes),
+    cpu_seconds: z.number().int().nonnegative().max(PWNTOOLS_LIMITS.cpuSeconds),
+    file_size_bytes: z
+      .number()
+      .int()
+      .nonnegative()
+      .max(PWNTOOLS_LIMITS.outputBytes),
+  }),
+  z.strictObject({
+    kind: z.literal("windows-job-object"),
+    job_memory_bytes: z
+      .number()
+      .int()
+      .positive()
+      .max(PWNTOOLS_LIMITS.addressSpaceBytes),
+  }),
+]);
 
 /** A missing or invalid report leaves limits unknown and retains its read failure. */
 export interface PwntoolsLimitReport {

@@ -19,6 +19,13 @@ The initial Linux note profile accepts System V/unspecified and GNU/Linux OSABI
 with ABI version zero. Other declared ABIs return `unsupported_target` before
 note interpretation; an unspecified OSABI alone does not prove OS origin.
 
+Offline inspection runs natively on Windows x64 as well as Linux x64. The
+Windows native owner applies and reads back a 3 GiB Job Object committed-memory
+limit before Python starts, with the same input/reply/diagnostic budgets and
+wall deadline. It does not claim POSIX CPU/file-size/address-space limits or a
+sandbox. Windows verification includes a real source-owned Linux x86-64 core;
+the selected format remains Linux ELF core, not a Windows minidump.
+
 ## Recorded observations
 
 - Artifact path, original SHA-256 and size; full normalized result and Evidence

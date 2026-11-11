@@ -11,6 +11,8 @@ export REA_KUNA_COMMAND=/absolute/path/to/kuna
 rea doctor --provider kuna
 ```
 
+For the Windows desktop, add the absolute `REA_KUNA_COMMAND` path to `providers.json`.
+
 Select it explicitly with `--provider kuna`, MCP's `open_binary.provider_id: "kuna"`, or `REA_ANALYSIS_PROVIDER=kuna`. With Kuna and another provider configured for the same target, `auto` reports `ambiguous` instead of choosing one.
 
 | Setting                       | Default                                                                                                                                 | Meaning                                                                                                                                                                                  |
@@ -22,7 +24,7 @@ Select it explicitly with `--provider kuna`, MCP's `open_binary.provider_id: "ku
 | `REA_KUNA_TIMEOUT_MS`         | 120 s                                                                                                                                   | Deadline for one single-function decompile, and for the inventory run REA makes when the export ends without one.                                                                        |
 | `REA_KUNA_JOBS`               | 1                                                                                                                                       | `decompile-project --jobs`. 1 is Kuna's reference answer; more jobs finish sooner but lose callee-first prototypes, and change about 40–60% of function bodies on the measured binaries. |
 
-Windows is not supported yet. Supported targets are ELF and thin Mach-O executables for x86-64, AArch64 and ARM; PE and universal Mach-O are rejected with a typed reason.
+Windows uses a native `kuna.exe` supervised by an owned Job Object. Its default cache is `%LOCALAPPDATA%/rea/kuna`, falling back to `%USERPROFILE%/AppData/Local/rea/kuna`; provider specs remain inside the selected cache, and each analysis uses its existing owned workspace for temporary files. No WSL process is used. Supported targets are ELF and thin Mach-O executables for x86-64, AArch64 and ARM; PE and universal Mach-O are rejected with a typed reason.
 
 ## What Kuna answers
 

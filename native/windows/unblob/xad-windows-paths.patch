@@ -1,0 +1,87 @@
+--- a/XADARCParser.m
++++ b/XADARCParser.m
+@@ -138,8 +138,6 @@
+ 
+ 		int namelength=0;
+ 		while(namelength<12 && namebuf[namelength]!=0) namelength++;
+-		if(namelength>1 && namebuf[namelength-1]==' ') namelength--;
+-		if(namelength>1 && namebuf[namelength-1]=='.') namelength--;
+ 		NSData *namedata=[NSData dataWithBytes:namebuf length:namelength];
+ 
+ 		uint32_t compsize=[fh readUInt32LE];
+--- a/XADStuffItParser.m
++++ b/XADStuffItParser.m
+@@ -114,7 +114,8 @@
+ 
+ 	/*uint32_t signature=*/[fh readID];
+ 	/*int numfiles=*/[fh readUInt16BE];
+-	int totalsize=[fh readUInt32BE];
++	uint32_t totalsize=[fh readUInt32BE];
++	if(totalsize<22 || totalsize>[fh fileSize]-base) [XADException raiseIllegalDataException];
+ 	//uint32_t signature2=[fh readID];
+ 	//int version=[fh readUInt8];
+ 	//[fh skipBytes:1]; // reserved byte
+@@ -146,12 +147,13 @@
+ 			int resourcepadding=header[SITFH_RSRCPAD];
+ 
+ 			int namelen=header[SITFH_FNAMESIZE];
+-			if(namelen>31) namelen=31;
++			if(namelen>31) [XADException raiseIllegalDataException];
+ 
+ 			XADString *name=[self XADStringWithBytes:header+SITFH_FNAME length:namelen];
+ 			XADPath *path=[currdir pathByAppendingXADStringComponent:name];
+ 
+ 			off_t start=[fh offsetInFile];
++			if((uint64_t)(uint32_t)datacomplen+(uint32_t)resourcecomplen>(uint64_t)(base+totalsize-start)) [XADException raiseIllegalDataException];
+ 
+ 			if((datamethod&StuffItFolderMask)==StuffItStartFolder||
+ 			(resourcemethod&StuffItFolderMask)==StuffItStartFolder)
+@@ -269,6 +271,7 @@
+ 		}
+ 		else [XADException raiseChecksumException];
+ 	}
++	if([fh offsetInFile]!=base+totalsize) [XADException raiseIllegalDataException];
+ }
+ 
+ -(XADString *)nameOfCompressionMethod:(int)method
+--- a/XADStuffIt5Parser.m
++++ b/XADStuffIt5Parser.m
+@@ -23,6 +23,7 @@
+ #import "NSDateXAD.h"
+ #import "XADRC4Handle.h"
+ #import "Crypto/md5.h"
++#import "CRC.h"
+ 
+ static NSData *StuffItMD5(NSData *data);
+ 
+@@ -219,6 +220,14 @@
+ 		[fh skipBytes:1];
+ 		int headersize=[fh readUInt16BE];
+ 		off_t headerend=offs+headersize;
++        if(headersize<48 || headerend>[fh fileSize]) [XADException raiseIllegalDataException];
++        [fh seekToFileOffset:offs];
++        NSMutableData *headerbytes=[NSMutableData dataWithData:[fh readDataOfLength:headersize]];
++        uint8_t *rawheader=[headerbytes mutableBytes];
++        uint16_t expectedcrc=CSUInt16BE(rawheader+32);
++        rawheader[32]=0; rawheader[33]=0;
++        if(expectedcrc!=XADCalculateCRC(0,rawheader,headersize,XADCRCTable_a001)) [XADException raiseChecksumException];
++        [fh seekToFileOffset:offs+8];
+ 		[fh skipBytes:1];
+ 		int flags=[fh readUInt8];
+ 		uint32_t creationdate=[fh readUInt32BE];
+@@ -256,6 +265,7 @@
+ 			else if(passlen) [XADException raiseNotSupportedException];
+ 		}
+ 
++		if(namelength>headerend-[fh offsetInFile]) [XADException raiseIllegalDataException];
+ 		NSData *namedata=[fh readDataOfLength:namelength];
+ 
+ 		XADString *comment=nil;
+@@ -298,6 +308,7 @@
+ 		off_t datastart=[fh offsetInFile];
+ 
+ 		XADPath *parent=[dirs objectForKey:[NSNumber numberWithInt:diroffs]];
++		if(!parent && diroffs!=0) [XADException raiseIllegalDataException];
+ 		if(!parent) parent=[self XADPath];
+ 		XADPath *path=[parent pathByAppendingXADStringComponent:[self XADStringWithData:namedata]];
+ 

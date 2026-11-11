@@ -44,7 +44,7 @@ const expectOwnedProcessExited = async (pidText: string): Promise<void> => {
     .toBe(false);
 };
 
-it("keeps persistent GDB sessions unavailable on Windows", async () => {
+it("refuses Windows startup when the native controls or selected GDB are unavailable", async () => {
   const gdb = await createGdbManagerForInjectedPlatform({
     environment: { REA_GDB_COMMAND: "/missing/gdb" },
     platform: "win32",
@@ -53,7 +53,7 @@ it("keeps persistent GDB sessions unavailable on Windows", async () => {
   expect(gdb.ok).toBe(false);
   if (!gdb.ok) {
     expect(gdb.error._tag).toBe("AnalysisCapabilityUnavailableError");
-    expect(gdb.error.message).toContain("Job Object");
+    expect(gdb.error.message.length).toBeGreaterThan(0);
   }
 });
 

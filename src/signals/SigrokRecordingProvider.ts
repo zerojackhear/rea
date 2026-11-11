@@ -1,4 +1,8 @@
 import {
+  artifactCommandHost,
+  prepareArtifactCommandBound,
+} from "../process/ArtifactCommandBound.js";
+import {
   type InspectSignalDecodersInput,
   signalDecodersSchema,
 } from "../domain/signals/signalDecoders.js";
@@ -8,7 +12,6 @@ import {
 } from "./parseDecoderDiscovery.js";
 import {
   BOUNDED_PRODUCER_LIMITS as LIMITS,
-  prlimitArgumentVector,
   readLinuxResourceLimits,
   type LinuxResourceLimits,
 } from "../process/LinuxResourceLimits.js";
@@ -128,10 +131,7 @@ export class SigrokRecordingProvider implements SignalRecordingPort {
     try {
       if (options?.signal?.aborted) throw new AnalysisCancelledError(operation);
       await this.#resources.release();
-      if (this.platform !== "linux")
-        throw new Error(
-          "Signal decoding requires Linux with util-linux prlimit and REA_SIGROK_COMMAND so expanded recordings are processed under an enforced address-space limit.",
-        );
+      const platform = artifactCommandHost(this.platform);
       const configured = this.environment.REA_SIGROK_COMMAND ?? "";
       if (!isAbsolute(configured))
         throw new Error(
@@ -144,19 +144,17 @@ export class SigrokRecordingProvider implements SignalRecordingPort {
         64 * 1024 * 1024,
         options?.signal,
       );
-      const configuredLimiter =
-        this.environment.REA_SIGROK_PRLIMIT_COMMAND ?? "/usr/bin/prlimit";
-      if (!isAbsolute(configuredLimiter))
-        throw new Error("REA_SIGROK_PRLIMIT_COMMAND must be absolute.");
-      const limiter = await realpath(configuredLimiter);
-      await access(limiter, constants.X_OK);
-      const limiterIdentity = await this.#resources.read(
-        limiter,
-        64 * 1024 * 1024,
-        options?.signal,
-      );
-      effectiveLimits = await this.#resources.readLimits(LIMITS);
-      const limitArguments = prlimitArgumentVector(effectiveLimits, command);
+      const bound = await prepareArtifactCommandBound({
+        platform,
+        environment: this.environment,
+        limiterVariable: "REA_SIGROK_PRLIMIT_COMMAND",
+        command,
+        operation,
+        resources: this.#resources,
+        limits: LIMITS,
+        ...(options?.signal === undefined ? {} : { signal: options.signal }),
+      });
+      effectiveLimits = bound.linuxLimits;
       phase = "workspace";
       root = await this.createRuntime();
       this.#resources.retain(root, undefined);
@@ -165,8 +163,7 @@ export class SigrokRecordingProvider implements SignalRecordingPort {
         capturedOutput = undefined;
         const output = await runOwnedCommand(
           {
-            command: limiter,
-            arguments: [...limitArguments, ...args],
+            ...bound.invocation(args),
             ...(root === undefined ? {} : { cwd: root.path }),
             expectedCommand: null,
             runId: `rea-sigrok-${randomUUID()}`,
@@ -191,23 +188,23 @@ export class SigrokRecordingProvider implements SignalRecordingPort {
           exit_code: output.exitCode ?? null,
           signal: output.signal ?? null,
         };
+        if (output.memoryLimitReached === true)
+          throw new AnalysisResourceConstraintError(
+            operation,
+            "memory",
+            "The owned Windows tool tree reached its Job Object memory limit.",
+            {
+              job_memory_bytes: bound.metadata.limits.job_memory_bytes ?? null,
+            },
+            { capturedOutput },
+          );
         // Finish bounded integrity checks after output; service handles late cancellation with Evidence.
         const previousPhase = phase;
         phase = "integrity";
         resourcePath = command;
         const current = await this.#resources.read(command, 64 * 1024 * 1024);
-        resourcePath = limiter;
-        const currentLimiter = await this.#resources.read(
-          limiter,
-          64 * 1024 * 1024,
-        );
-        if (currentLimiter.sha256 !== limiterIdentity.sha256)
-          throw new AnalysisArtifactChangedError(
-            operation,
-            limiter,
-            "Configured resource limiter changed during analysis.",
-            { capturedOutput },
-          );
+        resourcePath = bound.verificationPath ?? command;
+        await bound.verify(capturedOutput);
         if (current.sha256 !== tool.sha256)
           throw new AnalysisArtifactChangedError(
             operation,
@@ -250,13 +247,7 @@ export class SigrokRecordingProvider implements SignalRecordingPort {
           version_diagnostics: version.stderr.text,
           arguments: [...args],
         },
-        resource_limiter: {
-          configured_path: configuredLimiter,
-          path: limiter,
-          sha256: limiterIdentity.sha256,
-          arguments: limitArguments,
-        },
-        limits: { ...LIMITS, ...effectiveLimits },
+        ...bound.metadata,
         hardware_acquisition: "not-performed" as const,
       });
       if (!("path" in input)) {
@@ -277,7 +268,8 @@ export class SigrokRecordingProvider implements SignalRecordingPort {
             limitations: [
               "Catalog and help are observed from the selected sigrok installation. Help lines preserve producer descriptions, not a separately validated parameter schema.",
               "Each request probes the installation again; pages do not share a frozen catalog. Decoder modules and libraries are trusted and not fully fingerprinted.",
-              "Hardware discovery, recording reads and acquisition are not requested. Linux per-process limits and bounded output apply; this is not an OS sandbox.",
+              "Hardware discovery, recording reads and acquisition are not requested.",
+              bound.limitation,
             ],
           }),
         );
@@ -347,7 +339,7 @@ export class SigrokRecordingProvider implements SignalRecordingPort {
               "Annotations are the selected decoder's interpretation of the recorded samples and caller-selected settings, not independently verified protocol semantics. Empty output does not establish absence of traffic.",
               "Sample-number ranges and display text are preserved verbatim, not converted to timestamps or parsed as a lossless byte stream. All producer stderr is retained, including warnings on exit zero.",
               "Only a private copy of the selected file is decoded. Hardware discovery/acquisition and target execution are not requested. Caller-supplied tools, plugins and decoder modules are trusted; this is not an OS sandbox.",
-              "Linux prlimit enforces soft and hard ceilings before execution, preserving stricter inherited limits: at most 1 GiB address space per process, 64 MiB per file, 30 CPU seconds and no core dumps. Effective limits are reported. Resident input is capped at 32 MiB, each command at 30 wall-clock seconds and combined output at 4 MiB. Output overflow fails. These are per-process/per-file limits, not aggregate memory or filesystem quotas; caller-supplied tools and the limiter are trusted.",
+              bound.limitation,
             ],
           }),
         );
@@ -491,7 +483,7 @@ export class SigrokRecordingProvider implements SignalRecordingPort {
           ...(observedOutput === undefined
             ? {}
             : { capturedOutput: observedOutput }),
-          userMessage: `${reason} On Linux, configure sigrok-cli 0.7.2 through REA_SIGROK_COMMAND and util-linux prlimit through REA_SIGROK_PRLIMIT_COMMAND (default /usr/bin/prlimit).`,
+          userMessage: `${reason} On Windows x64 or Linux, configure sigrok-cli 0.7.2 through REA_SIGROK_COMMAND. Linux additionally requires util-linux prlimit through REA_SIGROK_PRLIMIT_COMMAND (default /usr/bin/prlimit).`,
         },
       );
     if (

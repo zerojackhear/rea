@@ -191,6 +191,7 @@ export const icons = {
 };
 export function classifyTool(tool) {
   const n = tool.name.toLowerCase();
+  if (/^(list|record|update|verify)_unknown/.test(n)) return "evidence";
   if (/electron/.test(n)) return "electron";
   if (/flutter|dart|android|apk|jadx|jeb|adb|dex|harmony|hap_/.test(n))
     return "mobile";
@@ -199,7 +200,9 @@ export function classifyTool(tool) {
   if (/(^|_)go(_|$)|rust|crate|cargo/.test(n)) return "go-rust";
   if (/wasm|evm|bytecode|wat_/.test(n)) return "wasm-evm";
   if (/sqlite|database/.test(n)) return "sqlite";
-  if (/pcap|qlog|signal|logic_|capture_file|network_record|har_/.test(n))
+  if (
+    /packet_|pcap|qlog|signal|logic_|capture_file|network_record|har_/.test(n)
+  )
     return "network";
   if (/browser|web_|page_|dom_|css_|cdp|website/.test(n)) return "browser";
   if (
@@ -239,4 +242,71 @@ export function moduleForPath(path) {
   if (/\.(?:pcap|pcapng|qlog|har|vcd|sr)$/i.test(path)) return "network";
   if (/\.(?:zip|tar|gz|xz|img|bin|plist)$/i.test(path)) return "firmware";
   return "native";
+}
+
+// Entry points are named contracts, never the first tool in catalog order.
+export const preferred = {
+  native: ["open_binary"],
+  javascript: ["analyze_javascript_application", "open_binary"],
+  electron: ["analyze_javascript_application", "inspect_electron_fuses"],
+  dotnet: ["inspect_managed_artifact"],
+  mobile: ["inspect_android_package"],
+  browser: ["list_browser_targets"],
+  firmware: ["open_binary"],
+  "go-rust": ["inspect_go_binary", "inspect_rust_binary"],
+  "wasm-evm": ["inspect_wasm_artifact", "inspect_evm_interface"],
+  sqlite: ["inspect_sqlite_database"],
+  network: ["inspect_pcap_capture"],
+  runtime: ["list_frida_devices"],
+  evidence: ["get_evidence_bundle"],
+  system: ["binary_session"],
+};
+
+export function toolsForModule(tools, id) {
+  return tools.filter(
+    (tool) =>
+      classifyTool(tool) === id ||
+      preferred[id]?.includes(tool.name) ||
+      (tool.name === "inspect_artifact" &&
+        ["native", "javascript", "electron"].includes(id)),
+  );
+}
+
+export function choosePreferred(tools, id) {
+  for (const name of preferred[id] ?? []) {
+    const tool = tools.find((item) => item.name === name);
+    if (tool) return tool;
+  }
+  return null;
+}
+
+/** Filename routing only selects an entry point; the core owns format detection. */
+export function fileEntry(path) {
+  if (/\.asar$/i.test(path))
+    return { tool: "analyze_javascript_application", module: "electron" };
+  if (/\.(?:js|cjs|mjs|ts|tsx|jsx|map)$/i.test(path))
+    return { tool: "open_binary", module: "javascript" };
+  if (/\.apk$/i.test(path))
+    return { tool: "inspect_android_package", module: "mobile" };
+  if (/\.(?:sqlite|sqlite3|db)$/i.test(path))
+    return { tool: "inspect_sqlite_database", module: "sqlite" };
+  if (/\.(?:wasm|wat)$/i.test(path))
+    return { tool: "inspect_wasm_artifact", module: "wasm-evm" };
+  if (/\.(?:pcap|pcapng)$/i.test(path))
+    return { tool: "inspect_pcap_capture", module: "network" };
+  if (/\.(?:har|qlog)$/i.test(path))
+    return {
+      tool: "inspect_web_network_capture",
+      module: "browser",
+      arguments: { format: /\.har$/i.test(path) ? "har" : "qlog" },
+    };
+  if (/\.(?:sr|vcd)$/i.test(path))
+    return { tool: "decode_signal_recording", module: "network" };
+  if (/\.dex$/i.test(path))
+    return { tool: "open_jeb_project", module: "mobile" };
+  if (/\.(?:zip|tar|gz|xz|img|plist|aab|hap|hsp|msix|appx)$/i.test(path))
+    return { tool: "open_binary", module: "firmware" };
+  if (/\.bin$/i.test(path))
+    return { tool: "inspect_firmware_regions", module: "firmware" };
+  return { tool: "open_binary", module: "native" };
 }

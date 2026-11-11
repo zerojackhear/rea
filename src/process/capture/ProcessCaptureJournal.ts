@@ -1,4 +1,4 @@
-import type { IPty } from "@lydell/node-pty";
+import type { ProcessCaptureTerminal } from "./ProcessCaptureTerminal.js";
 
 import type { ProcessScenario } from "../../domain/process/processScenario.js";
 import {
@@ -37,7 +37,7 @@ export const createProcessCaptureJournal = (): ProcessCaptureJournal => {
 
 interface ScenarioInteractionOptions {
   readonly scenario: ProcessScenario;
-  readonly getTerminal: () => IPty | undefined;
+  readonly getTerminal: () => ProcessCaptureTerminal | undefined;
   readonly timers: Set<ProcessTimer>;
   readonly interactions: InteractionEvent[];
   readonly renderer: TerminalRenderer;

@@ -126,11 +126,11 @@ it("distinguishes an unset command from an invalid one", async () => {
   });
 });
 
-it("declares Windows hosts unsupported before touching the command", async () => {
+it("declares unsupported hosts before touching the command", async () => {
   expect(
     await inspectKunaInstallation(
       { REA_KUNA_COMMAND: "/opt/kuna/kuna" },
-      { platform: "win32" },
+      { platform: "freebsd" },
     ),
   ).toMatchObject({ ok: false, error: { code: "unsupported_host" } });
 });

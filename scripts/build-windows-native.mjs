@@ -9,7 +9,8 @@ import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const nodeVersion = "22.19.0";
-const compiler = "x86_64-w64-mingw32-g++";
+const windowsHost = process.platform === "win32";
+const compiler = windowsHost ? "cl.exe" : "x86_64-w64-mingw32-g++";
 const cache = join(homedir(), ".cache", "rea-windows-native");
 const inspectionFixture = process.argv[2] === "--inspection-fixture";
 if (process.argv.length > 3 || (process.argv.length > 2 && !inspectionFixture))
@@ -34,11 +35,13 @@ const run = (command, args) => {
     );
   return result.stdout;
 };
-if (process.platform !== "linux")
+if (process.platform !== "linux" && !windowsHost)
   throw new Error(
-    "The Windows x64 artifact build lane currently requires Linux and MinGW-w64.",
+    "The Windows x64 artifact build lane requires Windows with an x64 MSVC developer environment, or Linux with MinGW-w64.",
   );
-run(compiler, ["--version"]);
+if (windowsHost && process.arch !== "x64")
+  throw new Error("The native Windows build lane requires an x64 host");
+run(compiler, windowsHost ? ["/?"] : ["--version"]);
 await mkdir(cache, { recursive: true });
 await mkdir(output, { recursive: true });
 const exists = async (path) =>
@@ -91,7 +94,13 @@ const artifact = "rea-windows-x64.node";
 // MSVC short-import libraries do not produce a correct Node import table with
 // GNU ld. Generate a GNU delay-import library for the exact stable Node-API
 // symbols; addon.cc binds it to the host executable, whatever its file name.
-const sources = ["addon.cc", "filesystem.cc", "process.cc"];
+const sources = [
+  "addon.cc",
+  "filesystem.cc",
+  "process.cc",
+  "appcontainer.cc",
+  "debugger.cc",
+];
 const sourceText = (
   await Promise.all(
     sources.map((path) =>
@@ -106,36 +115,105 @@ const symbols = [
     ),
   ),
 ].sort();
-const definition = join(cache, "node-api.def");
+const definition = join(output, "node-api.def");
 const library = join(cache, "libnode-api.a");
 await writeFile(
   definition,
   `LIBRARY node.exe\nEXPORTS\n${symbols.join("\n")}\n`,
 );
-run("x86_64-w64-mingw32-dlltool", ["-d", definition, "-y", library]);
-run(compiler, [
-  "-std=c++17",
-  "-O2",
-  "-DNAPI_VERSION=8",
-  "-D_WIN32_WINNT=0x0A00",
-  "-shared",
-  "-static",
-  "-static-libgcc",
-  "-static-libstdc++",
-  "-Wl,--no-insert-timestamp",
-  `-I${headers}`,
-  "native/windows/src/addon.cc",
-  inspectionFixture
-    ? "tests/fixtures/windows-native-inspection-failure.cc"
-    : "native/windows/src/filesystem.cc",
-  "native/windows/src/process.cc",
-  library,
-  "-ladvapi32",
-  "-lbcrypt",
-  "-lntdll",
-  "-o",
-  join(output, artifact),
-]);
+if (windowsHost) {
+  // Use the caller's existing x64 Developer Command Prompt environment. No
+  // compiler, SDK or global tool is installed or upgraded by this build lane.
+  const importLibrary = join(output, "node-api.lib");
+  run("lib.exe", [
+    "/nologo",
+    "/machine:x64",
+    `/def:${definition}`,
+    `/out:${importLibrary}`,
+  ]);
+  const compileSources = [
+    "native/windows/src/addon.cc",
+    inspectionFixture
+      ? "tests/fixtures/windows-native-inspection-failure.cc"
+      : "native/windows/src/filesystem.cc",
+    "native/windows/src/process.cc",
+    "native/windows/src/appcontainer.cc",
+    "native/windows/src/debugger.cc",
+  ];
+  const objects = [];
+  for (const [index, source] of compileSources.entries()) {
+    const object = join(output, `source-${index}.obj`);
+    run(compiler, [
+      "/nologo",
+      "/std:c++17",
+      "/O2",
+      "/EHsc",
+      "/MT",
+      "/GS",
+      "/guard:cf",
+      "/DNAPI_VERSION=8",
+      "/D_WIN32_WINNT=0x0A00",
+      "/D_CRT_SECURE_NO_WARNINGS",
+      `/I${headers}`,
+      "/c",
+      source,
+      `/Fo${object}`,
+    ]);
+    objects.push(object);
+  }
+  run("link.exe", [
+    "/nologo",
+    "/DLL",
+    "/MACHINE:X64",
+    "/INCREMENTAL:NO",
+    "/BREPRO",
+    "/DYNAMICBASE",
+    "/NXCOMPAT",
+    "/guard:cf",
+    "/DELAYLOAD:node.exe",
+    `/OUT:${join(output, artifact)}`,
+    ...objects,
+    importLibrary,
+    "delayimp.lib",
+    "kernel32.lib",
+    "advapi32.lib",
+    "bcrypt.lib",
+    "ntdll.lib",
+    "userenv.lib",
+    "ole32.lib",
+    "shell32.lib",
+  ]);
+} else {
+  run("x86_64-w64-mingw32-dlltool", ["-d", definition, "-y", library]);
+  run(compiler, [
+    "-std=c++17",
+    "-O2",
+    "-DNAPI_VERSION=8",
+    "-D_WIN32_WINNT=0x0A00",
+    "-shared",
+    "-static",
+    "-static-libgcc",
+    "-static-libstdc++",
+    "-Wl,--no-insert-timestamp",
+    `-I${headers}`,
+    "native/windows/src/addon.cc",
+    inspectionFixture
+      ? "tests/fixtures/windows-native-inspection-failure.cc"
+      : "native/windows/src/filesystem.cc",
+    "native/windows/src/process.cc",
+    "native/windows/src/appcontainer.cc",
+    "native/windows/src/debugger.cc",
+    library,
+    "-ladvapi32",
+    "-lbcrypt",
+    "-lntdll",
+    "-luserenv",
+    "-lole32",
+    "-lshell32",
+    "-o",
+    join(output, artifact),
+  ]);
+}
 const packageJson = JSON.parse(
   await readFile(join(root, "package.json"), "utf8"),
 );

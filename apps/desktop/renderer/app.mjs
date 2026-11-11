@@ -1,6 +1,15 @@
-import { modules, icons, classifyTool, moduleForPath } from "./modules.mjs";
+import {
+  modules,
+  icons,
+  classifyTool,
+  fileEntry,
+  choosePreferred,
+  toolsForModule as catalogToolsForModule,
+} from "./modules.mjs";
 import { fieldType } from "./schema.mjs";
 import { ToolDraftStore } from "./drafts.mjs";
+import { toolDiagnostic } from "./diagnostics.mjs";
+import { toolHelp, toolSearchText } from "./tool-help.mjs";
 
 const api = window.rea;
 const content = document.querySelector("#content");
@@ -15,6 +24,7 @@ const state = {
   filter: "all",
   selectedTool: null,
   selectedPath: "",
+  directoryChoice: "",
   panelTab: "parameters",
   drafts: new ToolDraftStore(),
   errors: [],
@@ -25,6 +35,9 @@ const state = {
   resultMode: "tree",
   loadingResult: false,
   loadingTools: false,
+  mcpSettings: null,
+  mcpSettingsError: "",
+  savingMcpSettings: false,
   connectError: "",
   searchLimit: 60,
 };
@@ -70,28 +83,6 @@ const labels = {
   command: "操作命令",
   pid: "目标进程 ID",
   url: "页面地址",
-};
-const preferred = {
-  javascript: [
-    "analyze_javascript_application",
-    "inspect_javascript_application",
-  ],
-  electron: ["analyze_javascript_application", "inspect_electron_application"],
-  native: ["analyze", "analyze_binary", "inspect_binary"],
-  mobile: [
-    "inspect_flutter_binary",
-    "inspect_flutter_aot",
-    "inspect_android_package",
-    "inspect_apk",
-  ],
-  dotnet: [
-    "inspect_managed_assembly",
-    "inspect_dotnet_assembly",
-    "analyze_managed_assembly",
-  ],
-  "go-rust": ["inspect_go_binary", "inspect_rust_binary"],
-  sqlite: ["inspect_sqlite_database"],
-  "wasm-evm": ["inspect_wasm_artifact", "inspect_evm_bytecode"],
 };
 
 function el(tag, className, text) {
@@ -208,18 +199,7 @@ function navigate(view, moduleId, toolName) {
   content.scrollTop = 0;
 }
 function toolsForModule(id) {
-  return state.tools.filter((tool) => classifyTool(tool) === id);
-}
-function choosePreferred(tools, id) {
-  for (const name of preferred[id] ?? []) {
-    const tool = tools.find((item) => item.name === name);
-    if (tool) return tool;
-  }
-  return (
-    tools.find((tool) => /^(inspect|analyze)_/.test(tool.name)) ??
-    tools[0] ??
-    null
-  );
+  return catalogToolsForModule(state.tools, id);
 }
 function ensureDraft(tool) {
   return state.drafts.get(tool, state.selectedPath);
@@ -261,6 +241,8 @@ function renderSidebar() {
 }
 function updateChrome() {
   renderSidebar();
+  const host = "Windows · 本机";
+  document.querySelector("#execution-host").textContent = host;
   const connection = state.engine.connection;
   const error = connection === "error" || !api;
   document.querySelector("#sidebar-dot").className =
@@ -271,11 +253,11 @@ function updateChrome() {
   document.querySelector("#sidebar-status").textContent = error
     ? "分析引擎未连接"
     : connection === "ready"
-      ? "本地引擎已就绪"
+      ? "Windows 引擎已就绪"
       : "正在连接分析引擎";
   document.querySelector("#sidebar-version").textContent = state.engine
     .coreVersion
-    ? "REA " + state.engine.coreVersion + " · 本机运行"
+    ? "REA " + state.engine.coreVersion + " · " + host
     : "所有分析在本机进行";
   document.querySelector("#statusbar-text").textContent = error
     ? "连接需要检查"
@@ -333,21 +315,51 @@ function connectionErrorBanner() {
     button("重新连接", "btn btn-small btn-ghost", refreshConnection, "refresh"),
   );
 }
-async function pickTarget(kind) {
+function selectEntry(path, entry) {
+  const tool = state.tools.find((item) => item.name === entry.tool);
+  if (!tool) throw new Error("当前引擎没有提供所需工具：" + entry.tool);
+  state.directoryChoice = "";
+  state.selectedPath = path;
+  navigate("module", entry.module, tool.name);
+  const selected = state.drafts.applyPath(tool, path);
+  if (!selected.ok) state.formError = selected.message;
+  else if (entry.arguments) {
+    const args = state.drafts.readArguments(tool);
+    if (args.ok)
+      state.drafts.replaceArguments(tool, {
+        ...args.arguments,
+        ...entry.arguments,
+      });
+    else {
+      // Required format can be supplied without discarding other invalid draft fields.
+      const draft = state.drafts.get(tool);
+      if (draft.mode === "fields")
+        for (const [key, value] of Object.entries(entry.arguments))
+          state.drafts.setField(tool, key, String(value));
+    }
+  }
+  render();
+}
+async function selectTarget(path) {
+  if (state.engine.connection !== "ready")
+    throw new Error("请等待本地引擎连接完成后再选择目标。");
+  const target = await api.describeTarget(path);
+  if (target.kind === "directory") {
+    state.directoryChoice = target.path;
+    navigate("home");
+    return;
+  }
+  selectEntry(target.path, fileEntry(target.path));
+}
+async function pickTarget(kind, defaultPath) {
   if (!api) throw new Error("请在 REA Desktop 应用中使用文件选择。");
   const path = await api.pickPath({
     kind,
+    ...(defaultPath ? { defaultPath } : {}),
     title: kind === "directory" ? "选择要分析的应用目录" : "选择要分析的文件",
   });
   if (!path) return;
-  state.selectedPath = path;
-  const moduleId = kind === "directory" ? "javascript" : moduleForPath(path);
-  navigate("module", moduleId);
-  if (state.selectedTool) {
-    const selected = state.drafts.applyPath(state.selectedTool, path);
-    if (!selected.ok) toast(selected.message, true);
-    render();
-  }
+  await selectTarget(path);
 }
 async function analyzeExample() {
   const example = await api.getExample();
@@ -399,6 +411,39 @@ function renderHome(container) {
     buttons.append(example);
   }
   drop.append(buttons);
+  if (state.directoryChoice) {
+    const directory = state.directoryChoice;
+    drop.append(
+      append(
+        el("div", "tool-contract-notice"),
+        el("p", "", "已选择目录：" + directory),
+        el(
+          "p",
+          "",
+          "普通软件请选择目录中的 EXE、DLL 或其他程序文件；JavaScript / Electron 项目可按目录分析。",
+        ),
+        append(
+          el("div", "button-row"),
+          button(
+            "选择目录中的程序文件",
+            "btn btn-primary",
+            () => pickTarget("file", directory),
+            "file",
+          ),
+          button(
+            "分析 JavaScript / Electron 项目",
+            "btn",
+            () =>
+              selectEntry(directory, {
+                tool: "analyze_javascript_application",
+                module: "javascript",
+              }),
+            "code",
+          ),
+        ),
+      ),
+    );
+  }
   drop.addEventListener("dragover", (event) => {
     event.preventDefault();
     drop.classList.add("dragging");
@@ -415,16 +460,7 @@ function renderHome(container) {
         toast("请选择本机文件或文件夹，以保留完整路径。");
         return;
       }
-      state.selectedPath = path;
-      navigate(
-        "module",
-        file.name.includes(".") ? moduleForPath(path) : "javascript",
-      );
-      if (state.selectedTool) {
-        const selected = state.drafts.applyPath(state.selectedTool, path);
-        if (!selected.ok) toast(selected.message, true);
-        render();
-      }
+      await selectTarget(path);
     } catch (error) {
       showError(error);
     }
@@ -588,6 +624,40 @@ function renderModule(container) {
     el("span", "pill", item.kind),
   );
   container.append(head);
+  if (state.moduleId === "javascript") {
+    container.append(
+      el(
+        "div",
+        "tool-contract-notice",
+        "单个脚本先打开文件，再选择 inspect_artifact 查看静态内容。项目目录和 ASAR 使用 analyze_javascript_application。",
+      ),
+    );
+  }
+  if (["native", "firmware"].includes(state.moduleId)) {
+    container.append(
+      append(
+        el("div", "tool-contract-notice"),
+        el(
+          "span",
+          "",
+          "先打开目标识别格式，再选择 binary_overview 查看软件总览。函数、反编译和会话工具需要对应分析引擎。",
+        ),
+        button(
+          "打开目标供后续分析",
+          "btn btn-small",
+          () => {
+            if (state.selectedPath)
+              selectEntry(state.selectedPath, {
+                tool: "open_binary",
+                module: state.moduleId,
+              });
+            else navigate("module", state.moduleId, "open_binary");
+          },
+          "folder",
+        ),
+      ),
+    );
+  }
   const error = connectionErrorBanner();
   if (error) container.append(error);
   const layout = el("div", "module-layout");
@@ -624,11 +694,7 @@ function renderToolList(list, tools) {
   list.replaceChildren();
   const query = state.toolFilter.trim().toLowerCase();
   const filtered = tools.filter(
-    (tool) =>
-      !query ||
-      (tool.name + " " + (tool.description ?? ""))
-        .toLowerCase()
-        .includes(query),
+    (tool) => !query || toolSearchText(tool).includes(query),
   );
   if (state.loadingTools) {
     list.append(
@@ -654,6 +720,7 @@ function renderToolList(list, tools) {
     return;
   }
   for (const tool of filtered) {
+    const help = toolHelp(tool);
     const node = button(
       "",
       "tool-item" + (state.selectedTool?.name === tool.name ? " selected" : ""),
@@ -668,8 +735,9 @@ function renderToolList(list, tools) {
       },
     );
     node.append(
-      el("strong", "", tool.name),
-      el("small", "", tool.description ?? "查看工具参数与说明"),
+      el("strong", "", help.title),
+      el("code", "tool-id", tool.name),
+      el("small", "", help.purpose),
     );
     list.append(node);
   }
@@ -681,6 +749,34 @@ function emptyPanel(title, description, iconName = "file", compact = false) {
     el(compact ? "h3" : "h2", "", title),
     el("p", "", description),
   );
+}
+function renderToolDescription(tool) {
+  const help = toolHelp(tool);
+  const description = el("div", "tool-description");
+  description.dataset.toolName = tool.name;
+  description.append(
+    el("h2", "", help.title),
+    el("code", "tool-id", tool.name),
+  );
+  const guide = el("dl", "tool-guide");
+  for (const [label, text] of [
+    ["能干什么", help.purpose],
+    ["怎么做", help.how],
+    ["使用前提与限制", help.note],
+  ]) {
+    guide.append(el("dt", "", label), el("dd", "", text));
+  }
+  description.append(guide);
+  if (tool.description) {
+    description.append(
+      append(
+        el("details", "original-tool-description"),
+        el("summary", "", "原始工具说明（英文）"),
+        el("p", "", tool.description),
+      ),
+    );
+  }
+  return description;
 }
 function renderWorkPanel(panel) {
   if (!panel) return;
@@ -720,13 +816,7 @@ function renderWorkPanel(panel) {
   }
   const tool = state.selectedTool;
   const draft = ensureDraft(tool);
-  panel.append(
-    append(
-      el("div", "tool-description"),
-      el("h2", "", tool.name),
-      el("p", "", tool.description ?? "请填写此工具所需的参数。"),
-    ),
-  );
+  panel.append(renderToolDescription(tool));
   if (
     moduleById(state.moduleId).active ||
     /^(launch|attach|execute|write|set|inject|resume|terminate|kill|install|setup)_/.test(
@@ -794,7 +884,12 @@ function renderWorkPanel(panel) {
   footer.append(
     append(el("span"), icon("shield"), "分析在本机进行，完整结果可导出"),
   );
-  const run = button("运行分析", "btn btn-primary", submitTool, "play");
+  const run = button(
+    tool.name === "open_binary" ? "打开软件" : "运行分析",
+    "btn btn-primary",
+    submitTool,
+    "play",
+  );
   run.id = "run-analysis";
   run.disabled = !api || state.engine.connection !== "ready";
   footer.append(run);
@@ -1140,7 +1235,48 @@ function renderResult(panel) {
     panel.append(
       el("div", "error-banner", "仅保存了标记的脱敏预览，不是完整原始证据。"),
     );
-  if (task.error) panel.append(el("div", "error-banner", message(task.error)));
+  const diagnostic = toolDiagnostic(record.result);
+  if (diagnostic) {
+    const banner = el("div", "error-banner");
+    banner.append(el("p", "", diagnostic.code + ": " + diagnostic.message));
+    if (diagnostic.code === "target_unavailable") {
+      banner.append(
+        el(
+          "p",
+          "",
+          "尚未打开分析目标。请先选择软件文件并运行“打开目标”，再使用此工具。",
+        ),
+      );
+      banner.append(
+        button(
+          "打开分析目标",
+          "btn btn-small",
+          () => {
+            if (state.selectedPath)
+              selectEntry(state.selectedPath, {
+                tool: "open_binary",
+                module: "native",
+              });
+            else navigate("module", "native", "open_binary");
+          },
+          "folder",
+        ),
+      );
+    }
+    if (diagnostic.code === "provider_unavailable")
+      banner.append(
+        el(
+          "p",
+          "",
+          "所需分析引擎未就绪。请按下面的具体原因配置；打开软件可先识别文件格式和架构。",
+        ),
+      );
+    if (diagnostic.action && diagnostic.action !== diagnostic.message)
+      banner.append(el("p", "", diagnostic.action));
+    for (const reason of diagnostic.reasons) banner.append(el("p", "", reason));
+    panel.append(banner);
+  } else if (task.error)
+    panel.append(el("div", "error-banner", message(task.error)));
   if (record.result?.isError && !task.error)
     panel.append(
       el(
@@ -1401,6 +1537,73 @@ function renderHistory(container) {
   }
   container.append(list);
 }
+function renderMcpSettings(container) {
+  const settings = state.mcpSettings;
+  const card = append(
+    el("section", "info-card"),
+    el("h2", "", "连接 MCP Agent"),
+    el(
+      "p",
+      "",
+      "将下方配置添加到支持 MCP 的 Agent，即可由它调用本机 REA。分析结果沿当前 MCP 连接返回，不绑定某一种 Agent。",
+    ),
+  );
+  const enabled = settings?.reviewAfterAnalysis === true;
+  const toggle = button(
+    enabled ? "已开启：汇报后等待你确认" : "已关闭：汇报后等待你确认",
+    "btn",
+    async () => {
+      if (!settings || state.savingMcpSettings) return;
+      state.savingMcpSettings = true;
+      render();
+      try {
+        state.mcpSettings = await api.setMcpSettings(!enabled);
+        state.mcpSettingsError = "";
+        toast("设置已保存；请更新 MCP 配置并重新连接 Agent。");
+      } catch (error) {
+        state.mcpSettingsError = message(error);
+        showError(error);
+      } finally {
+        state.savingMcpSettings = false;
+        render();
+      }
+    },
+    "settings",
+  );
+  toggle.setAttribute("role", "switch");
+  toggle.setAttribute("aria-checked", String(enabled));
+  toggle.disabled = !settings || state.savingMcpSettings;
+  const copy = button(
+    "复制 MCP 连接配置",
+    "btn btn-ghost",
+    async () => {
+      try {
+        await api.copyText(await api.getMcpConfiguration());
+        toast("MCP 配置已复制。更新连接端配置后重连即可生效。");
+      } catch (error) {
+        showError(error);
+      }
+    },
+    "copy",
+  );
+  copy.disabled = !settings || state.savingMcpSettings;
+  card.append(
+    append(el("div", "button-row"), toggle, copy),
+    el(
+      "p",
+      "",
+      "默认关闭。开启后，REA 会请求 Agent 在完成你要求的分析后说明结论、证据和未确定项，并等待下一步；是否遵从由连接端 Agent 决定。修改后需更新配置并重连。",
+    ),
+    el(
+      "p",
+      "",
+      "桌面窗口与外部 Agent 各有独立会话；此配置用于 Agent 发起的分析，不会自动发送桌面历史结果。",
+    ),
+  );
+  if (state.mcpSettingsError)
+    card.append(el("p", "error", state.mcpSettingsError));
+  container.append(card);
+}
 function renderEnvironment(container) {
   container.append(
     append(
@@ -1442,6 +1645,7 @@ function renderEnvironment(container) {
     ),
   );
   container.append(connection);
+  renderMcpSettings(container);
   const grid = el("div", "environment-grid");
   for (const [title, value, note, iconName] of [
     [
@@ -1517,13 +1721,7 @@ function renderSearch(container) {
   const tools = state.tools.filter(
     (tool) =>
       !query ||
-      (
-        tool.name +
-        " " +
-        (tool.description ?? "") +
-        " " +
-        moduleById(classifyTool(tool)).title
-      )
+      (toolSearchText(tool) + " " + moduleById(classifyTool(tool)).title)
         .toLowerCase()
         .includes(query),
   );
@@ -1547,7 +1745,7 @@ function renderSearch(container) {
       emptyPanel(
         "没有找到匹配的工具",
         state.tools.length
-          ? "试试英文工具名、中文模块名，或换一个更短的关键词。"
+          ? "试试中文用途、中文工具名或英文工具名，或换一个更短的关键词。"
           : "本地引擎连接完成后，工具会出现在这里。",
         "search",
       ),
@@ -1557,6 +1755,7 @@ function renderSearch(container) {
   const list = el("div", "search-results");
   for (const tool of tools.slice(0, state.searchLimit)) {
     const module = moduleById(classifyTool(tool));
+    const help = toolHelp(tool);
     const card = button("", "search-result", () =>
       navigate("module", module.id, tool.name),
     );
@@ -1564,8 +1763,9 @@ function renderSearch(container) {
       icon(module.icon),
       append(
         el("div"),
-        el("strong", "", tool.name),
-        el("p", "", tool.description ?? "查看此工具的参数与说明。"),
+        el("strong", "", help.title),
+        el("code", "tool-id", tool.name),
+        el("p", "", help.purpose),
         el("small", "", module.title),
       ),
     );
@@ -1610,6 +1810,7 @@ async function refreshConnection() {
       api.getState(),
       api.listTools(),
       api.listHistory(),
+      api.getMcpSettings ? api.getMcpSettings() : Promise.resolve(null),
     ]);
     if (results[0].status === "fulfilled") state.engine = results[0].value;
     if (results[1].status === "fulfilled") {
@@ -1619,6 +1820,10 @@ async function refreshConnection() {
       state.connectError = "";
     } else state.connectError = message(results[1].reason);
     if (results[2].status === "fulfilled") state.history = results[2].value;
+    if (results[3].status === "fulfilled") {
+      state.mcpSettings = results[3].value;
+      state.mcpSettingsError = "";
+    } else state.mcpSettingsError = message(results[3].reason);
     if (results[0].status === "rejected" && results[1].status === "rejected")
       state.engine = { connection: "error", error: state.connectError };
     if (state.view === "module" && !state.selectedTool) {

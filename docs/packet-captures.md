@@ -6,11 +6,11 @@ field/filter interface when the installed TShark supports their encapsulation
 and dissectors. This tool does not acquire traffic, open an interface or control
 a device. HAR/SAZ/mitmproxy web-capture workflows remain separate.
 
-Supply an existing TShark 4.x installation **on Linux**, with util-linux
-`prlimit` available at `/usr/bin/prlimit`. Override its absolute path with
-`REA_TSHARK_PRLIMIT_COMMAND` if required. Unsupported hosts, including macOS
-and Windows, are refused before inspection because this integration requires
-an enforced address-space limit:
+Supply an existing TShark 4.x installation on **Linux or Windows x64**.
+Linux requires util-linux `prlimit` (default `/usr/bin/prlimit`, overridden by
+`REA_TSHARK_PRLIMIT_COMMAND`). Windows runs the native executable inside an
+owned Job Object; WSL and capture drivers are not required for file analysis.
+macOS remains unsupported by this bounded adapter:
 
 ```sh
 export REA_TSHARK_COMMAND=/absolute/path/to/tshark
@@ -110,14 +110,18 @@ fully fingerprinted, and can influence dissection. This is not an OS sandbox.
 
 Input is limited to 32 MiB before reading, each command to 30 seconds, and
 combined stdout/stderr to 4 MiB during collection. Output overflow fails instead
-of returning truncated success. Before execution, `prlimit` enforces **1 GiB
+of returning truncated success. On Linux, before execution, `prlimit` enforces **1 GiB
 address space per process**, **64 MiB per file**, **30 CPU seconds** and no core
 dumps. Stricter inherited soft/hard limits are preserved; Evidence records the effective
 ceilings. Both limits are set before execution, so dissector allocations and
 compressed-capture expansion cannot exceed the per-process address-space cap.
 These are not aggregate process-memory or filesystem quotas. The selected
 limiter is trusted; its path, digest and arguments are retained in Evidence.
-No arbitrary process flags are accepted.
+On Windows, a 1 GiB committed-memory limit applies to the entire owned tool
+process tree. Evidence reports `windows-job-object` and `job_memory_bytes`;
+Linux address-space, per-file and CPU-time limits are explicitly null.
+Input, output and wall-clock limits remain enforced. There is no filesystem or
+network sandbox. No arbitrary process flags are accepted.
 
 ## Verification
 
@@ -132,7 +136,7 @@ fields, filtering, decode-as, both pass modes, a packet limit before matching
 frames, Evidence persistence, failure diagnostics, source identity and cleanup.
 An optional positional REA entrypoint verifies an installed package.
 
-The real-tool lane requires Linux and TShark 4.x. A separate kernel-limit
+The real-tool lane supports Linux and Windows x64 with TShark 4.x. A separate kernel-limit
 regression checks the inherited soft/hard limits and verifies an oversized
 allocation is refused before it can consume memory. The Ubuntu workflow uses
 its distribution package; check its outcome before claiming that build verified.
@@ -172,7 +176,7 @@ remain separate registrations. A listed field is an installation capability, not
 proof that the field appears in a selected recording.
 
 The adapter uses the documented `tshark -G fields` grammar under its existing
-private empty profile and Linux process limits. TShark 4.6.9's full glossary was
+private empty profile and the host-specific process limits. TShark 4.6.9's full glossary was
 measured at 22,303,197 bytes; discovery admits at most **32 MiB** combined command
 output (capture inspection remains at **4 MiB**). Parsing walks lines once and
 constructs objects only for the selected page. Returned strings are copied so

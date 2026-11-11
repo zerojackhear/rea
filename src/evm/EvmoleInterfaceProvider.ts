@@ -63,7 +63,7 @@ import {
 
 const OPERATION = "inspect_evm_interface";
 const HOST_REQUIREMENT =
-  "Initial real-verified offline EVM interface profile supports Linux x64 only.";
+  "Offline EVM interface inspection supports Linux x64 and Windows x64.";
 const replySchema = z.discriminatedUnion("ok", [
   z.strictObject({
     ok: z.literal(true),
@@ -200,58 +200,62 @@ export class EvmoleInterfaceProvider implements EvmInterfacePort {
     let retainedOutput: AnalysisCapturedOutput | undefined;
     let phase: "configuration" | "artifact-read" | "worker" = "configuration";
     let workerLimits: EvmWorkerLimits | undefined;
-    const limiter =
-      this.environment.REA_EVM_PRLIMIT_COMMAND ?? "/usr/bin/prlimit";
+    const windows = process.platform === "win32";
+    const limiter = windows
+      ? process.execPath
+      : (this.environment.REA_EVM_PRLIMIT_COMMAND ?? "/usr/bin/prlimit");
     let result: Result<EvmInterfaceExecution, AnalysisError>;
     try {
       if (options?.signal?.aborted) throw new AnalysisCancelledError(OPERATION);
-      if (process.platform !== "linux" || process.arch !== "x64")
+      if ((!windows && process.platform !== "linux") || process.arch !== "x64")
         throw new AnalysisCapabilityUnavailableError(
           EVMOLE_PROVIDER_IDENTITY.id,
           OPERATION,
           HOST_REQUIREMENT,
           { userMessage: HOST_REQUIREMENT },
         );
-      try {
-        if (!isAbsolute(limiter))
-          throw new Error(
-            "REA_EVM_PRLIMIT_COMMAND must be an absolute executable path.",
+      if (!windows) {
+        try {
+          if (!isAbsolute(limiter))
+            throw new Error(
+              "REA_EVM_PRLIMIT_COMMAND must be an absolute executable path.",
+            );
+          await access(limiter, constants.X_OK);
+          if (!(await stat(limiter)).isFile())
+            throw new Error(
+              "Configured prlimit must be a regular executable file, not a directory.",
+            );
+        } catch (cause: unknown) {
+          const reason = `Offline EVM interface inspection requires caller-supplied util-linux prlimit: ${limiter}; ${cause instanceof Error ? cause.message : String(cause)}`;
+          throw new AnalysisCapabilityUnavailableError(
+            EVMOLE_PROVIDER_IDENTITY.id,
+            OPERATION,
+            reason,
+            { cause, userMessage: reason },
           );
-        await access(limiter, constants.X_OK);
-        if (!(await stat(limiter)).isFile())
-          throw new Error(
-            "Configured prlimit must be a regular executable file, not a directory.",
+        }
+        let inheritedLimits: string;
+        try {
+          inheritedLimits = await readFile("/proc/self/limits", "utf8");
+        } catch (cause: unknown) {
+          const reason = `Could not read inherited Linux resource limits at /proc/self/limits: ${cause instanceof Error ? cause.message : String(cause)}`;
+          throw new AnalysisCapabilityUnavailableError(
+            EVMOLE_PROVIDER_IDENTITY.id,
+            OPERATION,
+            reason,
+            { cause, userMessage: reason },
           );
-      } catch (cause: unknown) {
-        const reason = `Offline EVM interface inspection requires caller-supplied util-linux prlimit: ${limiter}; ${cause instanceof Error ? cause.message : String(cause)}`;
-        throw new AnalysisCapabilityUnavailableError(
-          EVMOLE_PROVIDER_IDENTITY.id,
-          OPERATION,
-          reason,
-          { cause, userMessage: reason },
-        );
+        }
+        const limits = selectEvmWorkerLimits(inheritedLimits);
+        if (!limits.ok)
+          throw new AnalysisCapabilityUnavailableError(
+            EVMOLE_PROVIDER_IDENTITY.id,
+            OPERATION,
+            limits.error,
+            { userMessage: limits.error },
+          );
+        workerLimits = limits.value;
       }
-      let inheritedLimits: string;
-      try {
-        inheritedLimits = await readFile("/proc/self/limits", "utf8");
-      } catch (cause: unknown) {
-        const reason = `Could not read inherited Linux resource limits at /proc/self/limits: ${cause instanceof Error ? cause.message : String(cause)}`;
-        throw new AnalysisCapabilityUnavailableError(
-          EVMOLE_PROVIDER_IDENTITY.id,
-          OPERATION,
-          reason,
-          { cause, userMessage: reason },
-        );
-      }
-      const limits = selectEvmWorkerLimits(inheritedLimits);
-      if (!limits.ok)
-        throw new AnalysisCapabilityUnavailableError(
-          EVMOLE_PROVIDER_IDENTITY.id,
-          OPERATION,
-          limits.error,
-          { userMessage: limits.error },
-        );
-      workerLimits = limits.value;
       phase = "artifact-read";
       const carrier = await readStableArtifact(
         input.path,
@@ -285,13 +289,20 @@ export class EvmoleInterfaceProvider implements EvmInterfacePort {
       const execution = await runOwnedCommand(
         {
           command: limiter,
+          ...(windows
+            ? { memoryLimitBytes: EVM_INTERFACE_LIMITS.addressSpaceBytes }
+            : {}),
           arguments: [
-            `--as=${String(workerLimits.addressSpaceBytes)}:`,
-            `--fsize=${String(workerLimits.fileSizeBytes)}:`,
-            "--core=0:",
-            `--cpu=${String(workerLimits.cpuSeconds)}:`,
-            "--",
-            process.execPath,
+            ...(workerLimits === undefined
+              ? []
+              : [
+                  `--as=${String(workerLimits.addressSpaceBytes)}:`,
+                  `--fsize=${String(workerLimits.fileSizeBytes)}:`,
+                  "--core=0:",
+                  `--cpu=${String(workerLimits.cpuSeconds)}:`,
+                  "--",
+                  process.execPath,
+                ]),
             "--max-old-space-size=256",
             "--v8-pool-size=1",
             "--disable-wasm-trap-handler",
@@ -324,6 +335,12 @@ export class EvmoleInterfaceProvider implements EvmInterfacePort {
           },
         },
       );
+      if (execution.memoryLimitReached === true)
+        throw new OwnedCommandFailure(
+          "process",
+          "Windows Job Object commit limit reached.",
+          execution,
+        );
       const capturedOutput = capturedEvmOutput(execution);
       retainedOutput = capturedOutput;
       let reply: z.output<typeof replySchema>;
@@ -405,13 +422,15 @@ export class EvmoleInterfaceProvider implements EvmInterfacePort {
           { capturedOutput },
         );
       const limitations = [
-        `Configured worker resource soft limits: address_space_bytes=${String(workerLimits.addressSpaceBytes)}, cpu_seconds=${String(workerLimits.cpuSeconds)}, file_size_bytes=${String(workerLimits.fileSizeBytes)}. Selected from inherited tighter limits; original hard limits are retained. Effective worker limits are not independently probed.`,
+        workerLimits === undefined
+          ? "Windows: an owned Job Object enforces 3 GiB committed memory across the tool process tree. Linux address-space, CPU-time and per-file limits do not apply; output admission remains bounded. No filesystem/network sandbox is provided."
+          : `Configured worker resource soft limits: address_space_bytes=${String(workerLimits.addressSpaceBytes)}, cpu_seconds=${String(workerLimits.cpuSeconds)}, file_size_bytes=${String(workerLimits.fileSizeBytes)}. Selected from inherited tighter limits; original hard limits are retained. Effective worker limits are not independently probed.`,
         "Upstream may also report terminal metadata while recovering selectors. Its reported values are retained in raw_result, but integer precision and non-text-key coverage are unknown in the JS binding; complete original bytecode remains available.",
         "Recovered selectors, argument strings and mutability are upstream inferences, not verified ABI signatures or names. Empty results do not prove the absence of callable dispatch.",
         "Bytecode kind, hardfork and deployed-contract authenticity are unknown. This inspection performs no target runtime execution, chain/RPC lookup or network request.",
         "Original carrier and decoded bytecode SHA-256 are distinct identities; SHA-256 is not the Ethereum Keccak code hash.",
         "Terminal CBOR metadata is an independently decoded candidate, not proof of Solidity origin, source identity or deployment. Nested or unsupported values retain explicit unavailable interpretation and original byte ranges.",
-        "The owned worker has a 256 MiB JavaScript heap, 3 GiB virtual address-space limit and 30-second deadline. Virtual address space is distinct from resident memory; limits fail without partial success.",
+        "The owned worker has a 256 MiB JavaScript heap and 30-second deadline; the host-specific memory boundary is reported separately. Limits fail without partial success.",
       ];
       const validated = evmInterfaceSchema.safeParse({
         artifact: {

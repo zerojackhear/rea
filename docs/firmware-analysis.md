@@ -4,7 +4,8 @@ REA accepts **Binwalk 3.1.x** for region inspection and **Unblob 26.6.x** for
 explicit extraction. The report parsers are verified with Binwalk 3.1.0 and
 Unblob 26.6.4. Another build on those lines is accepted, the observed version
 is reported, and a limitation records that the parser was not verified against
-that build. This first firmware milestone is verified on Linux x64.
+that build. Region inspection also runs natively on Windows x64 with Binwalk
+3.1.0. Windows x64 extraction uses the native runtime and AppContainer adapter described below.
 No device, root privilege, mount, emulation or execution of extracted programs
 is needed. Arbitrary firmware bytes do not pass native executable admission;
 select a returned ELF separately for supported Ghidra analysis.
@@ -26,8 +27,14 @@ REA does not install these tools, their dependencies or system packages. It
 checks the tool's `--version` banner when executing a request. Binwalk must
 print `binwalk <version>` and Unblob must print the version alone. Inspection and
 extraction have independent prerequisites; one does not require the other.
-Both require util-linux `prlimit`, normally `/usr/bin/prlimit`; override its
-absolute path with `REA_FIRMWARE_PRLIMIT_COMMAND` if needed.
+On Linux both require util-linux `prlimit`, normally `/usr/bin/prlimit`; override
+its absolute path with `REA_FIRMWARE_PRLIMIT_COMMAND` if needed. Windows Binwalk
+uses a native owned Job Object, a 1 GiB committed-memory bound for its process
+tree, and the same input, report, diagnostic and wall-clock budgets. No Windows
+filesystem/network sandbox or Linux address-space/CPU/file-size limit is claimed.
+Set `REA_BINWALK_COMMAND` to the absolute path of `binwalk.exe`; WSL is not used.
+`node scripts/verify/firmware/inspection.mjs --report <new-report.json>` checks
+real CLI/MCP inspection using generated gzip and nonsignature fixtures.
 
 REA retains at most 8 MiB of combined stdout and stderr per command. Exceeding
 that diagnostic budget stops analysis with an explicit truncated-output error;
@@ -35,7 +42,7 @@ child process limits do not bound parent-side pipe retention. Completed commands
 drain their output streams before recording diagnostics. Failed worker cleanup
 retains the worker and workspace for retry before another request or at shutdown.
 
-Unblob needs the external extractor for the selected format on its inherited
+On Linux, Unblob needs the external extractor for the selected format on its inherited
 `PATH`: for example, `debugfs` for ext2/ext3/ext4. Its default Landlock sandbox
 and skip rules stay enabled. Sandbox startup failures remain actionable errors;
 REA does not retry with `--no-sandbox`. Missing extractors reported in a valid
@@ -49,6 +56,37 @@ git submodule update --init third_party/binwalk third_party/unblob
 
 Normal REA builds and npm packages do not include or build these sources or
 engine binaries. See [upstream provenance](https://github.com/morluto/rea/blob/main/third_party/README.md).
+
+## Windows native extraction
+
+Set `REA_UNBLOB_COMMAND` to the native runtime's absolute `python.exe` path.
+The same directory must contain `rea-unblob-runtime.json` with `schemaVersion: 1`
+and a `files` array of `{path, bytes, sha256}` records. Paths use `/` and name
+every runtime file, including Python, DLLs and the patched Python packages.
+See [the source port](https://github.com/morluto/rea/tree/main/native/windows/unblob).
+An ordinary upstream Unblob installation cannot bypass the Windows sandbox.
+
+REA snapshots only inventoried files into an owned directory, verifies their
+lengths and hashes, seals them against writes/replacement, then hashes them again.
+The inventory identifies caller-supplied bytes; it is not a publisher signature.
+The source inventory is limited to 4 MiB, 8192 files and 512 MiB of runtime bytes.
+Unlisted source files are never copied or loaded. No Python startup environment
+or ambient credentials are inherited by the worker.
+
+The bundled native addon creates a unique AppContainer, assigns a 1 GiB Job
+Object before execution, and checks the exact SID, zero capabilities and child
+process prohibition before resuming the worker. Engine/input and the whole
+profile storage are read-only. The fixed output tree permits data writes;
+its files and diagnostics are metered with the existing deadline and cancellation.
+Polling can transiently overshoot and is not a disk quota. Cleanup first verifies
+all job processes have stopped, then removes the owned profile and workspace;
+failed cleanup retains its owner for retry. Abrupt host termination kills workers
+but can leave private directories/profiles requiring later explicit cleanup.
+
+Native library extraction currently covers TAR, CPIO, ZIP, gzip (including joined
+and split streams), bzip2, XZ/LZMA, Zstandard and LZ4/legacy LZ4. No child executable
+is silently enabled for other formats. Missing helper-backed formats retain their
+actual diagnostics and partial coverage. WSL is not used for this adapter.
 
 ## CLI and MCP
 

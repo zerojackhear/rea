@@ -47,6 +47,12 @@ const inspectionSchema = z.strictObject({
   protocolStdin: z.boolean().optional(),
   /** Absent from artifacts built before owned Job Object commit limits. */
   jobMemoryLimit: z.literal(true).optional(),
+  /** Native, handle-owned AppContainer preparation and suspended-token checks. */
+  appContainer: z.literal(true).optional(),
+  /** Owned ConPTY launch/resize and asynchronous terminal closure. */
+  conpty: z.literal(true).optional(),
+  /** Debugger-only lifetime control and read-only inferior identity inspection. */
+  debuggerLeaderOnly: z.literal(true).optional(),
 });
 
 type NativeCall = (

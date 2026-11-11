@@ -8,7 +8,9 @@ import { projectAnalysisError } from "../../../src/domain/analysisErrorProjectio
 import { spawnOwnedProviderProcess } from "../../../src/process/ProviderProcess.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 
-const unsupportedHost = process.platform !== "linux" || process.arch !== "x64";
+const unsupportedHost =
+  (process.platform !== "linux" && process.platform !== "win32") ||
+  process.arch !== "x64";
 const DEFAULT_INPUT_BYTES = 33_554_432;
 // One byte above the shipped bound, so the admission decision is the only
 // difference between the first two cases.
@@ -30,6 +32,9 @@ const inspect = async (override?: string) => {
   const provider = new PwntoolsLayoutProvider(
     {
       REA_PWNTOOLS_PYTHON: process.execPath,
+      // Windows Node's CSPRNG needs SystemRoot. Supply it in this Node fixture,
+      // without adding ambient variables to the production Python boundary.
+      SystemRoot: process.env.SystemRoot,
       ...(override === undefined
         ? {}
         : { REA_PWNTOOLS_MAX_INPUT_BYTES: override }),

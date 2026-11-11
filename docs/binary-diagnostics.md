@@ -8,8 +8,8 @@ ordinary binary inspection use the same modular capability.
 
 ## Bring your own engine
 
-Initial real verification covers **Linux x64, ELF64 x86-64 little-endian
-EXEC/DYN/REL**. Provide an absolute Python executable whose environment already
+Real verification covers **Windows x64 and Linux x64 hosts, ELF64 x86-64
+little-endian EXEC/DYN/REL**. Provide an absolute Python executable whose environment already
 contains unchanged pwntools 4.15.0, pyelftools 0.33 and Unicorn 2.1.2:
 
 ```sh
@@ -107,15 +107,26 @@ a caller-configured `StdioClientTransport({ maxBufferSize: ... })` and a matchin
 server `REA_MCP_MAX_RESPONSE_BYTES`. See [MCP delivery budgets](mcp-contracts.md#tool-results).
 These settings affect delivery, not decoder coverage or limits. The large
 extended-index verification uses 256 MiB and an explicit five-minute request
-timeout in its separate opt-in MCP lane. REA does not silently truncate the result. Python lowers resource soft limits to at most 3 GiB virtual address space,
+timeout in its separate opt-in MCP lane. REA does not silently truncate the result. On Linux, Python lowers resource soft limits to at most 3 GiB virtual address space,
 30 CPU seconds and 64 MiB file output. Inherited tighter soft/hard limits are
 retained, and the effective values are returned in the result limitations. Virtual address space is not RSS;
 Unicorn needs a large virtual map. Limits fail with no partial success, and
 owned process/root cleanup completes independently of cancellation.
 
+Windows uses a native Job Object with a 3 GiB committed-memory bound for the
+whole process tree. The native owner sets and verifies the bound before starting
+Python. Its private request carries that fact to the bridge; a venv launcher's
+inner Job Object cannot reveal the parent's still-enforced limit. The same
+input/reply/diagnostic budgets and 30-second wall deadline apply. This does not
+claim POSIX address-space, per-file or CPU limits, or a filesystem/network sandbox.
+Set the desktop `REA_PWNTOOLS_PYTHON` path to the native Python executable.
+`scripts/verify-pwntools-native.mjs --fixtures <dir> --report <new-file>` runs
+real CLI/MCP checks on separately generated ELF/core fixtures without executing
+them during analysis.
+
 Core files, GDB session/state/control, optional pwndbg enrichment and instruction
 inspection are separate increments tracked by #969. This increment makes no
-real support claim for those features or other operating systems/architectures.
+real support claim for those features or additional target architectures.
 
 Typed decoder failures retain bounded `captured_output` (stdout, stderr and an
 explicit truncation flag) alongside the original failure category and reason.

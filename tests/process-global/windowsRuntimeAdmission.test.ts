@@ -97,3 +97,134 @@ it("does not infer a transient status from a human-readable diagnostic", () => {
   }
   expect(observed).toBe(cause);
 });
+
+const identity = {
+  requestedPath: "C:\\test\\selected",
+  finalPath: "C:\\test\\selected",
+  filesystem: "NTFS",
+  volumeSerial: "0".repeat(16),
+  fileId: "1".repeat(32),
+  size: 3,
+  directory: false,
+} as const;
+const copied = { sha256: "a".repeat(64), source: identity, snapshot: identity };
+const snapshotFailure = (facts: Record<string, unknown> = {}) =>
+  Object.assign(new Error("Selected snapshot admission failure"), {
+    code: "ERR_REA_WINDOWS_NATIVE",
+    win32Code: 32,
+    snapshotAllocation: "not-started",
+    ...facts,
+  });
+const admittedRuntime = (copy: () => unknown) => {
+  nativeCall.mockImplementation((operation: string) => {
+    if (operation === "runtime_create")
+      return {
+        ...identity,
+        path: identity.finalPath,
+        directory: true,
+        privateDacl: true,
+        handle: {},
+      };
+    if (operation === "runtime_snapshot") return copy();
+    return undefined;
+  });
+  return WindowsPrivateRuntime.create("C:\\test", "selected-");
+};
+
+it("retries only pre-copy sharing admission and preserves the byte bound", async () => {
+  const failure = snapshotFailure();
+  const copy = vi
+    .fn()
+    .mockImplementationOnce(() => {
+      throw failure;
+    })
+    .mockResolvedValue(copied);
+  const runtime = admittedRuntime(copy);
+  try {
+    await expect(
+      runtime.snapshot("selected", "output", undefined, 3),
+    ).resolves.toEqual(copied);
+    expect(copy).toHaveBeenCalledTimes(2);
+    expect(nativeCall).toHaveBeenLastCalledWith("runtime_snapshot", [
+      runtime.observation.handle,
+      "selected",
+      "output",
+      3,
+    ]);
+  } finally {
+    await runtime.close();
+  }
+});
+
+it.each([
+  { snapshotAllocation: undefined },
+  { snapshotAllocation: "started" },
+  { win32Code: 5 },
+  { win32Code: "32" },
+  { code: "EACCES" },
+])(
+  "does not retry an unproven or non-sharing copy failure: %j",
+  async (facts) => {
+    const failure = snapshotFailure(facts);
+    const copy = vi.fn(() => {
+      throw failure;
+    });
+    const runtime = admittedRuntime(copy);
+    try {
+      await expect(runtime.snapshot("selected", "output")).rejects.toBe(
+        failure,
+      );
+      expect(copy).toHaveBeenCalledTimes(1);
+    } finally {
+      await runtime.close();
+    }
+  },
+);
+
+it("never replays an asynchronously rejected accepted copy", async () => {
+  const failure = snapshotFailure();
+  const copy = vi.fn().mockRejectedValue(failure);
+  const runtime = admittedRuntime(copy);
+  try {
+    await expect(runtime.snapshot("selected", "output")).rejects.toBe(failure);
+    expect(copy).toHaveBeenCalledTimes(1);
+  } finally {
+    await runtime.close();
+  }
+});
+
+it("bounds repeated contention and retains the actual native error", async () => {
+  const failure = snapshotFailure();
+  const copy = vi.fn(() => {
+    throw failure;
+  });
+  const runtime = admittedRuntime(copy);
+  try {
+    await expect(runtime.snapshot("selected", "output")).rejects.toBe(failure);
+    expect(copy).toHaveBeenCalledTimes(4);
+  } finally {
+    await runtime.close();
+  }
+});
+
+it("cancels admission backoff without cancelling another native copy", async () => {
+  const failure = snapshotFailure();
+  const copy = vi.fn(() => {
+    throw failure;
+  });
+  const runtime = admittedRuntime(copy);
+  const controller = new AbortController();
+  try {
+    const pending = runtime.snapshot("selected", "output", controller.signal);
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(copy).toHaveBeenCalledTimes(1);
+    expect(
+      nativeCall.mock.calls.some(
+        ([operation]) => operation === "runtime_snapshot_cancel",
+      ),
+    ).toBe(false);
+  } finally {
+    await runtime.close();
+  }
+});

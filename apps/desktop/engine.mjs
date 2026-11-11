@@ -596,16 +596,20 @@ async function ensureDirectory(path) {
   return realpath(path);
 }
 
-async function connectProduction(coreRoot, onFault) {
+export async function connectProduction(coreRoot, onFault) {
   const require = createRequire(join(coreRoot, "package.json"));
   const sdk = await import(
     pathToFileURL(require.resolve("@modelcontextprotocol/client")).href
   );
-  const transport = new OwnedStdioTransport({
+  const launch = {
     command: process.execPath,
     args: [join(coreRoot, "scripts", "rea.mjs"), "mcp"],
     cwd: coreRoot,
     env: { ...process.env, REA_LOG_LEVEL: "warn" },
+    executionEnvironment: { kind: process.platform },
+  };
+  const transport = new OwnedStdioTransport({
+    ...launch,
     ReadBuffer: sdk.ReadBuffer,
     serializeMessage: sdk.serializeMessage,
     onFault,
@@ -618,7 +622,12 @@ async function connectProduction(coreRoot, onFault) {
     await client.connect(transport, { timeout: 60_000 });
     const tools = (await client.listTools(undefined, { timeout: 60_000 }))
       .tools;
-    return { client, transport, tools };
+    return {
+      client,
+      transport,
+      tools,
+      executionEnvironment: launch.executionEnvironment,
+    };
   } catch (error) {
     error.ownedConnection = { client, transport };
     throw error;
@@ -788,6 +797,10 @@ export function createDesktopEngine({
           setState({
             connection: "ready",
             toolsCount: definitions.size,
+            executionEnvironment: connection.executionEnvironment,
+            ...(connection.executionEnvironment?.nodeVersion
+              ? { nodeVersion: connection.executionEnvironment.nodeVersion }
+              : {}),
             error: undefined,
           });
         } catch (error) {
@@ -859,6 +872,11 @@ export function createDesktopEngine({
         const task = {
           id: randomUUID(),
           engineSessionId: sessionId,
+          ...(connection.executionEnvironment
+            ? {
+                executionEnvironment: snapshot(connection.executionEnvironment),
+              }
+            : {}),
           tool: request.payload.tool,
           arguments: recorded.arguments,
           state: "queued",
@@ -1191,7 +1209,12 @@ async function startIpcEngine() {
   const send = (message) => {
     if (process.connected) process.send(message, () => {});
   };
-  const engine = createDesktopEngine({ coreRoot, dataDirectory, emit: send });
+  const engine = createDesktopEngine({
+    coreRoot,
+    dataDirectory,
+    emit: send,
+    connect: connectProduction,
+  });
   process.on("message", (message) => {
     void (async () => {
       let request;

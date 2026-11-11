@@ -57,6 +57,34 @@ test("nullable scalar references remain editable while preserving metadata", () 
   assert.equal(field.schema.description, "Choose the requested detail.");
 });
 
+test("untouched nullable scalar defaults stay omitted instead of becoming invalid form values", () => {
+  const fields = schemaFields({
+    type: "object",
+    properties: {
+      filter: { type: ["string", "null"], default: null },
+      limit: { type: ["integer", "null"], default: null },
+      enabled: { type: ["boolean", "null"], default: null },
+      values: { type: ["array", "null"], default: null },
+      offset: { type: "integer", default: 0 },
+      flag: { type: "boolean", default: false },
+    },
+  });
+  const values = Object.fromEntries(
+    fields.map((f) => [f.key, defaultFieldValue(f.schema)]),
+  );
+  const converted = formArgumentsToJson(fields, values);
+  assert.equal(converted.ok, true);
+  assert.deepEqual(JSON.parse(converted.value), {
+    values: null,
+    offset: 0,
+    flag: false,
+  });
+  assert.deepEqual(
+    readJsonArguments('{"filter":null,"limit":null,"enabled":null}'),
+    { filter: null, limit: null, enabled: null },
+  );
+});
+
 test("unresolved and cyclic local references return bounded unknown definitions", () => {
   assert.deepEqual(dereference({ $ref: "#/$defs/missing" }, {}), {
     $ref: "#/$defs/missing",

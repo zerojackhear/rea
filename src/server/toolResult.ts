@@ -1,3 +1,8 @@
+import {
+  AGENT_REVIEW_EXTRA_BYTES,
+  AGENT_REVIEW_META,
+  AGENT_REVIEW_NOTICE,
+} from "./agentReview.js";
 import { INSPECT_ANALYSIS_VIEW_OPERATION } from "../domain/analysisView/analysisViewErrors.js";
 import type { CallToolResult } from "@modelcontextprotocol/server";
 import { STDIO_DEFAULT_MAX_BUFFER_SIZE } from "@modelcontextprotocol/server";
@@ -22,8 +27,12 @@ import {
 /** Create one delivery policy from the already selected, parsed response budget. */
 export const createToolResultDelivery = (
   maximumResponseBytes: number | undefined,
+  reviewAfterAnalysis = false,
 ): ToolResultDelivery =>
-  new ToolResultDelivery(maximumResponseBytes ?? STDIO_DEFAULT_MAX_BUFFER_SIZE);
+  new ToolResultDelivery(
+    maximumResponseBytes ?? STDIO_DEFAULT_MAX_BUFFER_SIZE,
+    reviewAfterAnalysis,
+  );
 
 /** Offer a named, schema-validated source page only for retained native analysis. */
 const nativeEvidenceContinuation = (
@@ -46,7 +55,10 @@ const nativeEvidenceContinuation = (
 /** Immutable encoding and recovery policy shared by one MCP server. */
 export class ToolResultDelivery {
   readonly resultBudgetBytes: number;
-  constructor(maximumResponseBytes: number) {
+  constructor(
+    maximumResponseBytes: number,
+    readonly reviewAfterAnalysis = false,
+  ) {
     this.resultBudgetBytes = maximumResponseBytes - 1024;
     Object.freeze(this);
   }
@@ -72,18 +84,23 @@ export class ToolResultDelivery {
   ): CallToolResult {
     return recorded !== undefined && !recorded.ok
       ? this.toErrorToolResult(recorded.error, contract.returnsTargetContent)
-      : this.successResult(evidence, contract, {
-          evidence_id: evidence.evidence_id,
-          ...(recorded === undefined
-            ? {}
-            : {
-                evidence_reference: {
-                  kind: "retained-evidence",
-                  evidence_id: evidence.evidence_id,
-                },
-                ...nativeEvidenceContinuation(evidence),
-              }),
-        });
+      : this.successResult(
+          evidence,
+          contract,
+          {
+            evidence_id: evidence.evidence_id,
+            ...(recorded === undefined
+              ? {}
+              : {
+                  evidence_reference: {
+                    kind: "retained-evidence",
+                    evidence_id: evidence.evidence_id,
+                  },
+                  ...nativeEvidenceContinuation(evidence),
+                }),
+          },
+          this.reviewAfterAnalysis,
+        );
   }
 
   /**
@@ -153,19 +170,31 @@ export class ToolResultDelivery {
     value: JsonValue,
     contract: ToolContract,
     recovery: Readonly<Record<string, JsonValue>> = {},
+    agentReview = false,
   ): CallToolResult {
+    const extraBytes = agentReview ? AGENT_REVIEW_EXTRA_BYTES : 0;
     const encoded = encodeToolResult(
       value,
-      this.resultBudgetBytes,
+      this.resultBudgetBytes - extraBytes,
       "structured-and-text",
       contract.returnsTargetContent,
     );
     if (encoded.ok)
       return {
-        content: [{ type: "text", text: encoded.text }],
+        content: [
+          { type: "text", text: encoded.text },
+          ...(agentReview ? [AGENT_REVIEW_NOTICE] : []),
+        ],
         structuredContent: value,
-        ...(contract.returnsTargetContent
-          ? { _meta: TARGET_CONTENT_RESULT_META }
+        ...(contract.returnsTargetContent || agentReview
+          ? {
+              _meta: {
+                ...(contract.returnsTargetContent
+                  ? TARGET_CONTENT_RESULT_META
+                  : {}),
+                ...(agentReview ? AGENT_REVIEW_META : {}),
+              },
+            }
           : {}),
       };
     const retainedEvidence = recovery.evidence_reference !== undefined;
@@ -189,7 +218,7 @@ export class ToolResultDelivery {
           default_receive_buffer_bytes: STDIO_DEFAULT_MAX_BUFFER_SIZE,
           result_budget_bytes: this.resultBudgetBytes,
           max_string_code_units: MCP_RESULT_STRING_LIMIT,
-          response_bytes_at_least: encoded.bytesAtLeast,
+          response_bytes_at_least: encoded.bytesAtLeast + extraBytes,
           response_code_units_at_least: encoded.codeUnitsAtLeast,
           constraint: encoded.constraint,
           ...recovery,

@@ -1,4 +1,5 @@
 import { join, isAbsolute } from "node:path";
+import { prepareWindowsFirmwareRuntime } from "./WindowsFirmwareRuntime.js";
 import { z } from "zod";
 import type { FirmwareAnalysisPort } from "../application/firmware/FirmwareAnalysisPort.js";
 import {
@@ -93,13 +94,20 @@ const waitForPredecessor = (
       resolve();
     });
   });
-const limitations = [
-  "Signature matches and reported sizes do not establish partition validity, encryption or runtime mappings. Binwalk may infer unknown lengths before emitting its report.",
-  "Only Linux is supported by this integration. One worker, inherited per-process address-space/file-size/CPU limits and a deadline constrain execution; staging byte and entry budgets are polled and may transiently overshoot. Limits are not aggregate process-memory or filesystem quotas.",
-  "Unblob's default sandbox and skip rules remain enabled. Missing external extractors, unknown chunks, encrypted chunks and depth limits yield partial coverage. Extracted code is never executed; only regular files are published, without executable permission bits.",
-  "extraction_gaps lists regions that were carved or left unextracted and names extractor dependencies the producer reported as missing. A listed gap does not mean the target is corrupt or that a retained region is empty.",
-  "The actual launcher executable is hashed. Interpreter, shared libraries and installed Python package dependencies are not independently attested; source revision remains unknown for caller-supplied builds.",
-] as const;
+const limitations = (windowsExtraction: boolean) =>
+  [
+    "Signature matches and reported sizes do not establish partition validity, encryption or runtime mappings. Binwalk may infer unknown lengths before emitting its report.",
+    windowsExtraction
+      ? "Windows extraction uses an exact-SID AppContainer with zero capabilities, no loopback exemption, prohibited child creation, immutable engine/input snapshots and an owned 1 GiB Job Object. The whole writable workspace is metered; polling may transiently overshoot. No Linux CPU-time/address-space limit or disk quota is claimed."
+      : process.platform === "win32"
+        ? "Windows Binwalk runs natively in an owned Job Object with a 1 GiB committed-memory bound for its process tree, one worker, bounded input/report/diagnostics and a 120-second deadline. No Linux address-space, CPU-time, per-file limit or filesystem/network sandbox is claimed."
+        : "Linux uses one worker, inherited per-process address-space/file-size/CPU limits and a deadline; staging byte and entry budgets are polled and may transiently overshoot. Limits are not aggregate process-memory or filesystem quotas.",
+    "For extraction, Unblob's default sandbox and skip rules remain enabled. Missing external extractors, unknown chunks, encrypted chunks and depth limits yield partial coverage. Extracted code is never executed; only regular files are published, without executable permission bits.",
+    "extraction_gaps lists regions that were carved or left unextracted and names extractor dependencies the producer reported as missing. A listed gap does not mean the target is corrupt or that a retained region is empty.",
+    windowsExtraction
+      ? "Every admitted Windows interpreter/package file is snapshotted and checked against the caller-supplied length/SHA-256 inventory before launch, then rehashed after sealing. This proves byte identity, not publisher authenticity. Source revision remains unknown for caller-supplied builds."
+      : "The actual launcher executable is hashed. Interpreter, shared libraries and installed Python package dependencies are not independently attested; source revision remains unknown for caller-supplied builds.",
+  ] as const;
 
 /** Queued bring-your-own firmware adapters with private snapshots and owned cleanup. */
 export class FirmwareProvider implements FirmwareAnalysisPort {
@@ -242,7 +250,22 @@ export class FirmwareProvider implements FirmwareAnalysisPort {
       );
       root = await PrivateRuntimeRoot.create({ prefix: "rea-firmware-" });
       const ownedRoot = root;
-      const target = await snapshotFirmware(request, root.path, signal);
+      const originalTarget = await snapshotFirmware(request, root.path, signal);
+      const sandbox =
+        process.platform === "win32" && engineName === "unblob"
+          ? await prepareWindowsFirmwareRuntime(
+              root.path,
+              command.command,
+              command.sha256,
+              originalTarget.inputPath,
+              signal,
+            )
+          : undefined;
+      const target = {
+        ...originalTarget,
+        inputPath: sandbox?.inputPath ?? originalTarget.inputPath,
+      };
+      const outputBase = sandbox?.outputPath ?? root.path;
       const run = (
         args: readonly string[],
         outputBudget?: { root: string; bytes: number; entries: number },
@@ -251,8 +274,14 @@ export class FirmwareProvider implements FirmwareAnalysisPort {
           engine: engineName,
           operation: request.operation,
           ...command,
-          args,
-          cwd: root?.path ?? "",
+          args: [...(sandbox?.args ?? []), ...args],
+          ...(sandbox === undefined
+            ? {}
+            : {
+                command: sandbox.command,
+                appContainerRuntime: sandbox.handle,
+              }),
+          cwd: outputBase,
           environment: this.environment,
           signal,
           retainCleanup: (supervisor) => {
@@ -264,9 +293,23 @@ export class FirmwareProvider implements FirmwareAnalysisPort {
             });
           },
           ...(this.launcher === undefined ? {} : { launcher: this.launcher }),
+          ...(sandbox === undefined
+            ? outputBudget === undefined
+              ? {}
+              : { outputBudget }
+            : {
+                outputBudget: {
+                  root: sandbox.outputPath,
+                  bytes:
+                    (outputBudget?.bytes ?? 0) +
+                    FIRMWARE_LIMITS.reportBytes +
+                    FIRMWARE_LIMITS.diagnosticBytes,
+                  entries: (outputBudget?.entries ?? 0) + 16,
+                },
+              }),
           ...(outputBudget === undefined
             ? {}
-            : { outputBudget, acceptReportedExtractionFailure: true }),
+            : { acceptReportedExtractionFailure: true }),
         });
       const versionRun = await run(["--version"]);
       const version = versionRun.stdout.text.trim();
@@ -291,7 +334,7 @@ export class FirmwareProvider implements FirmwareAnalysisPort {
         source_revision: null,
         worker_count: 1 as const,
       };
-      const reportPath = join(root.path, "report.json");
+      const reportPath = join(outputBase, "report.json");
       let result: unknown;
       let raw: unknown;
       if (request.operation === "inspect_firmware_regions") {
@@ -330,7 +373,7 @@ export class FirmwareProvider implements FirmwareAnalysisPort {
               message: "Extraction output directory must be absolute",
             },
           ]);
-        const outputRoot = join(root.path, "extracted");
+        const outputRoot = join(outputBase, "extracted");
         const processRun = await run(
           [
             "--process-num",
@@ -342,7 +385,7 @@ export class FirmwareProvider implements FirmwareAnalysisPort {
             "--report",
             reportPath,
             "--log",
-            join(root.path, "unblob.log"),
+            join(outputBase, "unblob.log"),
             "--extract-dir",
             outputRoot,
             target.inputPath,
@@ -409,9 +452,12 @@ export class FirmwareProvider implements FirmwareAnalysisPort {
           { ...catalog, version: admitted.version },
           {
             subject: target.subject,
-            rawResult: raw,
+            rawResult:
+              sandbox === undefined
+                ? raw
+                : { extraction: raw, windows_runtime: sandbox.evidence },
             limitations: [
-              ...limitations,
+              ...limitations(sandbox !== undefined),
               ...(admitted.status === "compatible"
                 ? [admitted.limitation]
                 : []),

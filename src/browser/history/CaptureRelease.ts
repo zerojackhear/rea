@@ -22,6 +22,9 @@ export const NODE_CAPTURE_HEAP_ENFORCED =
 export const NODE_CAPTURE_PROCESS_MEMORY_LIMIT_BYTES =
   javaScriptWorkerMemoryLimitBytes(NODE_CAPTURE_HEAP_LIMITS.oldGenerationMiB);
 
+/** Maximum native decoder memory: Linux address space or Windows job commit. */
+export const MITMPROXY_CAPTURE_MEMORY_BYTES = 768 * 1024 * 1024;
+
 /** Native executable profile verified with unchanged mitmproxy raw-state decoding. */
 export const MITMPROXY_CAPTURE_PROVIDER_IDENTITY = {
   id: "mitmproxy-native-tnetstring",

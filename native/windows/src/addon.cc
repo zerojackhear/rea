@@ -110,6 +110,8 @@ napi_value failureValue(napi_env env, const Failure& failure) {
     }
     if (failure.runtimeDirectoryUnallocated)
       set(env, error, "runtimeAllocation", string(env, std::string("not-started")));
+    if (failure.snapshotDestinationUnallocated)
+      set(env, error, "snapshotAllocation", string(env, std::string("not-started")));
     return error;
 }
 
@@ -153,6 +155,7 @@ static napi_value call(napi_env env, napi_callback_info info) {
       return inspect(env, context.pending);
     }
     if (operation.rfind(L"process_", 0) == 0) return processCall(env, operation, values);
+    if (operation.rfind(L"debugger_", 0) == 0) return debuggerCall(env, operation, values);
     return filesystemCall(env, operation, values, context);
   } catch (const Failure& failure) {
     auto error = failureValue(env, failure);

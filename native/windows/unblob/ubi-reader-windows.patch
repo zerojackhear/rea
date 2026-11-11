@@ -1,0 +1,378 @@
+--- /dev/null
++++ b/ubireader/ubi/readonly.py
+@@ -0,0 +1,150 @@
++"""Strict UBI mapping; damaged or absent LEBs are not invented as erased data.
++SPDX-License-Identifier: GPL-3.0-or-later
++"""
++from collections import Counter, defaultdict
++from dataclasses import dataclass
++import zlib
++
++from ubireader.ubi import headers
++from ubireader.ubi import defines as d
++
++
++def guess_peb_size(source):
++    original = source.tell()
++    positions = []
++    attempts = 0
++    try:
++        source.seek(0)
++        offset = 0
++        prefix = b""
++        while True:
++            part = source.read(65536)
++            if not part:
++                break
++            resume = source.tell()
++            data = prefix + part
++            index = data.find(d.UBI_EC_HDR_MAGIC)
++            while index != -1:
++                attempts += 1
++                if attempts > 100_000:
++                    raise ValueError("UBI header search exceeds its 100000-candidate bound")
++                position = offset - len(prefix) + index
++                source.seek(position)
++                raw = source.read(d.UBI_EC_HDR_SZ)
++                if len(raw) == d.UBI_EC_HDR_SZ:
++                    ec = headers.ec_hdr(raw)
++                    if not ec.errors and ec.version == 1 and ec.vid_hdr_offset >= 64 and ec.data_offset >= ec.vid_hdr_offset + 64:
++                        positions.append(position)
++                index = data.find(d.UBI_EC_HDR_MAGIC, index + 1)
++            source.seek(resume)
++            offset += len(part)
++            prefix = data[-3:]
++        if len(positions) < 2 or positions[0] != 0:
++            raise ValueError("UBI physical erase-block size cannot be established from valid headers")
++        intervals = Counter(b - a for a, b in zip(positions, positions[1:]))
++        return intervals.most_common(1)[0][0]
++    finally:
++        source.seek(original)
++
++
++@dataclass
++class Block:
++    vid: object
++    position: int
++    length: int
++    source_peb: int
++
++
++@dataclass
++class Volume:
++    number: int
++    table: object
++    blocks: list
++
++
++def read_volumes(source, size):
++    peb = guess_peb_size(source)
++    if peb < 128 or size % peb:
++        raise ValueError("UBI input does not contain whole physical erase blocks")
++    blocks = defaultdict(dict)
++    sequences = set()
++    for offset in range(0, size, peb):
++        source.seek(offset)
++        ec = headers.ec_hdr(source.read(d.UBI_EC_HDR_SZ))
++        if ec.magic != d.UBI_EC_HDR_MAGIC or ec.version != 1 or ec.errors:
++            raise ValueError(f"UBI erase-count header CRC or identity mismatch at offset {offset}")
++        if not 64 <= ec.vid_hdr_offset <= ec.data_offset - 64 or ec.data_offset >= peb:
++            raise ValueError("UBI header/data offsets cross the physical erase block")
++        sequences.add(ec.image_seq)
++        if len(sequences) > 1:
++            raise ValueError("UBI image sequence identities disagree")
++        source.seek(offset + ec.vid_hdr_offset)
++        raw = source.read(d.UBI_VID_HDR_SZ)
++        if raw == b"\xff" * d.UBI_VID_HDR_SZ:
++            continue
++        vid = headers.vid_hdr(raw)
++        if vid.magic != d.UBI_VID_HDR_MAGIC or vid.version != 1 or vid.errors:
++            raise ValueError(f"UBI volume header CRC or identity mismatch at offset {offset}")
++        if vid.vol_type not in (1, 2) or vid.copy_flag not in (0, 1) or vid.data_pad >= peb - ec.data_offset:
++            raise ValueError("UBI volume header has invalid type, copy flag or data padding")
++        available = peb - ec.data_offset - vid.data_pad
++        if vid.vol_type == d.UBI_VID_STATIC or vid.copy_flag:
++            if not 0 < vid.data_size <= available:
++                raise ValueError("UBI copied/static block length exceeds its extent")
++            source.seek(offset + ec.data_offset)
++            if (~zlib.crc32(source.read(vid.data_size)) & 0xffffffff) != vid.data_crc:
++                raise ValueError("UBI static/copied data CRC mismatch")
++        elif vid.data_size or vid.used_ebs or vid.data_crc:
++            raise ValueError("UBI dynamic block has unexplained static-data metadata")
++        length = vid.data_size if vid.vol_type == d.UBI_VID_STATIC else available
++        block = Block(vid, offset + ec.data_offset, length, offset // peb)
++        previous = blocks[vid.vol_id].get(vid.lnum)
++        if previous is not None and previous.vid.sqnum == vid.sqnum:
++            source.seek(previous.position); old = source.read(previous.length)
++            source.seek(block.position); new = source.read(block.length)
++            if old != new or previous.vid.__dict__ != vid.__dict__:
++                raise ValueError("Conflicting UBI blocks share a sequence and logical identity")
++        if previous is None or previous.vid.sqnum < vid.sqnum:
++            blocks[vid.vol_id][vid.lnum] = block
++    layouts = blocks.pop(d.UBI_INTERNAL_VOL_START, None)
++    if layouts is None or set(layouts) != {0, 1}:
++        raise ValueError("UBI volume-table copies are incomplete")
++    tables = []
++    for index in (0, 1):
++        block = layouts[index]
++        if block.length < d.UBI_MAX_VOLUMES * d.UBI_VTBL_REC_SZ:
++            raise ValueError("UBI volume table is truncated")
++        source.seek(block.position)
++        raw = source.read(d.UBI_MAX_VOLUMES * d.UBI_VTBL_REC_SZ)
++        table = []
++        for number in range(d.UBI_MAX_VOLUMES):
++            record = headers._vtbl_rec(raw[number * d.UBI_VTBL_REC_SZ:(number + 1) * d.UBI_VTBL_REC_SZ])
++            if record.errors:
++                raise ValueError("UBI volume-table record CRC mismatch")
++            table.append(record)
++        tables.append((raw, table))
++    if tables[0][0] != tables[1][0]:
++        raise ValueError("UBI volume-table copies disagree")
++    result = []
++    for number, table in enumerate(tables[0][1]):
++        if table.reserved_pebs == 0:
++            if number in blocks:
++                raise ValueError("UBI blocks refer to an unallocated volume")
++            continue
++        if table.upd_marker or table.vol_type not in (1, 2) or not 0 < table.name_len <= 127 or table.alignment == 0:
++            raise ValueError("UBI volume has incomplete update or invalid table metadata")
++        candidates = blocks.pop(number, {})
++        ordered = sorted(candidates.items())
++        if not ordered:
++            raise ValueError("UBI volume has no observed data blocks; its content is unknown")
++        if ordered[-1][0] >= table.reserved_pebs or any(index != lnum for index, (lnum, _) in enumerate(ordered)):
++            raise ValueError("UBI logical block is absent or outside the volume; no erased-byte repair was applied")
++        for _, block in ordered:
++            if block.vid.vol_type != table.vol_type or block.vid.data_pad != table.data_pad:
++                raise ValueError("UBI block type or padding disagrees with its volume table")
++            if table.vol_type == d.UBI_VID_STATIC and block.vid.used_ebs != len(ordered):
++                raise ValueError("UBI static volume has missing declared logical blocks")
++        result.append(Volume(number, table, [block for _, block in ordered]))
++    if blocks:
++        raise ValueError("UBI contains unrecognized internal or unlisted volume identities")
++    return peb, sequences.pop(), result
+--- a/ubireader/ubifs/misc.py
++++ b/ubireader/ubifs/misc.py
+@@ -17,7 +17,6 @@
+ # along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ #############################################################
+ 
+-from lzallright import LZOCompressor, LZOError
+ import struct
+ import zlib
+ from ubireader.ubifs.defines import *
+@@ -41,12 +40,14 @@
+     Int:khash      -- Key hash.
+     """
+     hkey, lkey = struct.unpack('<II',key[0:UBIFS_SK_LEN])
+-    ino_num = hkey & UBIFS_S_KEY_HASH_MASK
++    ino_num = hkey
+     key_type = lkey >> UBIFS_S_KEY_BLOCK_BITS
+     khash = lkey
+ 
+     #if key_type < UBIFS_KEY_TYPES_CNT:
+-    return {'type':key_type, 'ino_num':ino_num, 'khash': khash}
++    if key_type >= UBIFS_KEY_TYPES_CNT or (len(key) > UBIFS_SK_LEN and any(key[UBIFS_SK_LEN:])):
++        raise ValueError('Unknown UBIFS key type or nonzero simple-key padding')
++    return {'type': key_type, 'ino_num': ino_num, 'khash': khash, 'value': lkey & UBIFS_S_KEY_BLOCK_MASK}
+ 
+ 
+ def decompress(ctype, unc_len, data):
+@@ -61,6 +62,7 @@
+     Uncompressed Data.
+     """
+     if ctype == UBIFS_COMPR_LZO:
++        from lzallright import LZOCompressor
+         try:
+             return LZOCompressor.decompress(data, output_size_hint=unc_len)
+         except Exception as e:
+--- a/ubireader/ubifs/nodes.py
++++ b/ubireader/ubifs/nodes.py
+@@ -97,7 +97,11 @@
+             else:
+                 setattr(self, key, fields[key])
+ 
+-        setattr(self, 'name', '%s' % buf[-self.nlen-1:-1].decode('utf-8'))
++        if (not 0 < self.nlen <= UBIFS_MAX_NLEN
++                or len(buf) != UBIFS_DENT_NODE_SZ + self.nlen + 1 or buf[-1] != 0
++                or b'\0' in buf[UBIFS_DENT_NODE_SZ:-1]):
++            raise ValueError('UBIFS directory name has an invalid extent or terminator')
++        setattr(self, 'name', buf[UBIFS_DENT_NODE_SZ:-1].decode('utf-8', 'strict'))
+         setattr(self, 'errors', [])
+ 
+     def __repr__(self):
+@@ -162,6 +166,9 @@
+         idxs = UBIFS_IDX_NODE_SZ
+         # Dynamic detection of `brs` (branch size), whether a hash is present after
+         # the key in authenticated UBIFS. Not checking the len of the hash.
++        if (self.child_cnt == 0 or (len(buf) - UBIFS_IDX_NODE_SZ) % self.child_cnt
++                or (len(buf) - UBIFS_IDX_NODE_SZ) // self.child_cnt < UBIFS_BRANCH_SZ):
++            raise ValueError('UBIFS index count or branch extent is invalid')
+         brs = (len(buf) - UBIFS_IDX_NODE_SZ) // self.child_cnt
+         setattr(self, 'branches', [branch(buf[idxs+(brs*i):idxs+(brs*i)+brs]) for i in range(0, self.child_cnt)])
+         setattr(self, 'errors', [])
+--- /dev/null
++++ b/ubireader/ubifs/readonly.py
+@@ -0,0 +1,162 @@
++"""Strict, read-only UBIFS committed-index reader.
++
++Uses ubi-reader's format structures. Does not replay a dirty journal, create
++files or replace damaged data. Caller owns output and reports coverage notes.
++SPDX-License-Identifier: GPL-3.0-or-later
++"""
++from collections import defaultdict
++from dataclasses import dataclass
++import struct
++import zlib
++
++from ubireader.ubifs import nodes
++from ubireader.ubifs import defines as d
++
++
++def read_node(source, position, boundary, expected_length=None):
++    if position < 0 or boundary - position < d.UBIFS_COMMON_HDR_SZ:
++        raise ValueError("UBIFS node address is outside its logical erase block")
++    source.seek(position)
++    header = nodes.common_hdr(source.read(d.UBIFS_COMMON_HDR_SZ))
++    if header.magic != int.from_bytes(d.UBIFS_NODE_MAGIC, "little"):
++        raise ValueError(f"UBIFS node magic mismatch at offset {position}")
++    if not d.UBIFS_COMMON_HDR_SZ <= header.len <= boundary - position:
++        raise ValueError("UBIFS node extent crosses its logical erase block")
++    if expected_length is not None and header.len != expected_length:
++        raise ValueError("UBIFS index length disagrees with its referenced node")
++    if header.group_type not in (0, 1, 2) or header.padding != bytes(2):
++        raise ValueError("UBIFS common header contains unknown flags or padding")
++    body = source.read(header.len - d.UBIFS_COMMON_HDR_SZ)
++    if len(body) != header.len - d.UBIFS_COMMON_HDR_SZ:
++        raise EOFError("Truncated UBIFS node")
++    # Kernel UBIFS CRC covers sqnum through the end, with initial 0xffffffff.
++    prefix = struct.pack("<QIBB2s", header.sqnum, header.len, header.node_type,
++                         header.group_type, header.padding)
++    if (~zlib.crc32(prefix + body) & 0xffffffff) != header.crc:
++        raise ValueError(f"UBIFS node CRC mismatch at offset {position}")
++    return header, body
++
++
++@dataclass
++class DataBlock:
++    node: object
++    encoded: bytes
++
++
++class CommittedTree:
++    def __init__(self, source, source_size):
++        self.inodes = {}
++        self.data = defaultdict(dict)
++        self.children = defaultdict(list)
++        self.notes = []
++        head, body = read_node(source, 0, source_size, 4096)
++        if head.node_type != d.UBIFS_SB_NODE:
++            raise ValueError("UBIFS image does not start with a superblock")
++        sb = nodes.sb_node(body)
++        self.superblock = sb
++        if (not 4096 <= sb.leb_size <= source_size or not 3 <= sb.leb_cnt <= sb.max_leb_cnt
++                or sb.leb_size * sb.leb_cnt > source_size
++                or sb.min_io_size < 8 or sb.min_io_size & (sb.min_io_size - 1)
++                or sb.leb_size % sb.min_io_size or sb.min_io_size > sb.leb_size):
++            raise ValueError("Invalid UBIFS geometry or truncated logical erase blocks")
++        if sb.key_fmt != 0 or sb.key_hash not in (0, 1) or sb.fmt_version > 5 or sb.ro_compat_version > 0:
++            raise ValueError("Unknown UBIFS key or on-flash format")
++        if sb.flags & ~14:
++            raise ValueError("Encrypted, authenticated or unknown UBIFS feature requires its own decoder")
++        if not 3 <= sb.fanout <= (sb.leb_size - 28) // d.UBIFS_BRANCH_SZ:
++            raise ValueError("Invalid UBIFS index fanout")
++
++        masters = []
++        step = ((512 + sb.min_io_size - 1) // sb.min_io_size) * sb.min_io_size
++        for leb in (1, 2):
++            candidates = []
++            for offset in range(0, sb.leb_size - 511, step):
++                position = leb * sb.leb_size + offset
++                source.seek(position)
++                if source.read(4) == b"\xff" * 4:
++                    break
++                ch, data = read_node(source, position, (leb + 1) * sb.leb_size, 512)
++                if ch.node_type != d.UBIFS_MST_NODE:
++                    raise ValueError("Unexpected node in UBIFS master area")
++                candidates.append((ch.sqnum, nodes.mst_node(data)))
++            if not candidates:
++                raise ValueError("UBIFS master copy is absent; commit identity is unknown")
++            masters.append(max(candidates, key=lambda item: item[0])[1])
++        identity = lambda m: (m.cmt_no, m.root_lnum, m.root_offs, m.root_len, m.leb_cnt, m.flags)
++        if identity(masters[0]) != identity(masters[1]):
++            raise ValueError("UBIFS master copies disagree; commit identity is unknown")
++        master = masters[0]
++        self.commit = master.cmt_no
++        if master.leb_cnt != sb.leb_cnt or master.flags & ~7:
++            raise ValueError("UBIFS master geometry or flags disagree with the superblock")
++        if master.flags & (d.UBIFS_MST_DIRTY | d.UBIFS_MST_RCVRY):
++            self.notes.append("Committed UBIFS index recovered; dirty/recovery journal state was not replayed and current files remain uncertain")
++        if not master.flags & d.UBIFS_MST_NO_ORPHS:
++            self.notes.append("UBIFS orphan processing was not applied to the committed index")
++
++        pending = [(master.root_lnum, master.root_offs, master.root_len, None, None)]
++        seen = set()
++        names = set()
++        while pending:
++            leb, offset, length, level, parent_key = pending.pop()
++            if len(seen) >= 100_000:
++                raise ValueError("UBIFS index exceeds its 100000-node work bound")
++            if (leb, offset) in seen:
++                raise ValueError("UBIFS index contains a repeated address or cycle")
++            if not 3 <= leb < sb.leb_cnt or offset < 0 or offset % 8:
++                raise ValueError("UBIFS branch points outside the main area or is unaligned")
++            seen.add((leb, offset))
++            head, body = read_node(source, leb * sb.leb_size + offset,
++                                   (leb + 1) * sb.leb_size, length)
++            if head.node_type == d.UBIFS_IDX_NODE:
++                index = nodes.idx_node(body)
++                if not 0 <= index.level < d.UBIFS_MAX_LEVELS or not 0 < index.child_cnt <= sb.fanout:
++                    raise ValueError("UBIFS index level or child count exceeds its format bound")
++                if level is not None and index.level != level:
++                    raise ValueError("UBIFS child index level disagrees with its parent")
++                if len(body) != d.UBIFS_IDX_NODE_SZ + index.child_cnt * d.UBIFS_BRANCH_SZ:
++                    raise ValueError("UBIFS index has an unknown branch layout")
++                if parent_key is not None and index.branches[0].key != parent_key:
++                    raise ValueError("UBIFS child index key disagrees with its parent")
++                previous = None
++                for branch in index.branches:
++                    order = (branch.key['ino_num'], branch.key['type'], branch.key['value'])
++                    if previous is not None and order < previous:
++                        raise ValueError("UBIFS index keys are not ordered")
++                    previous = order
++                    pending.append((branch.lnum, branch.offs, branch.len, index.level - 1, branch.key))
++            else:
++                if level != -1:
++                    raise ValueError("UBIFS leaf occurs at an unexpected index depth")
++                if head.node_type == d.UBIFS_INO_NODE:
++                    node = nodes.ino_node(body)
++                    if len(body) != d.UBIFS_INO_NODE_SZ + node.data_len:
++                        raise ValueError("UBIFS inode inline length mismatch")
++                    if node.key['ino_num'] in self.inodes:
++                        raise ValueError("UBIFS index contains duplicate inode identities")
++                    self.inodes[node.key['ino_num']] = node
++                elif head.node_type == d.UBIFS_DATA_NODE:
++                    node = nodes.data_node(body, leb * sb.leb_size + offset + 48)
++                    if not 0 < node.size <= d.UBIFS_BLOCK_SIZE or node.compr_size:
++                        raise ValueError("UBIFS data node has invalid or encrypted extents")
++                    blocks = self.data[node.key['ino_num']]
++                    if node.key['value'] in blocks:
++                        raise ValueError("UBIFS index contains duplicate data block identities")
++                    blocks[node.key['value']] = DataBlock(node, body[d.UBIFS_DATA_NODE_SZ:])
++                elif head.node_type in (d.UBIFS_DENT_NODE, d.UBIFS_XENT_NODE):
++                    node = nodes.dent_node(body)
++                    if head.node_type == d.UBIFS_XENT_NODE:
++                        if "Extended UBIFS metadata retained in input, not applied to Windows" not in self.notes:
++                            self.notes.append("Extended UBIFS metadata retained in input, not applied to Windows")
++                    else:
++                        key = (node.key['ino_num'], node.name)
++                        if key in names or not node.inum:
++                            raise ValueError("UBIFS committed directory contains duplicate or removed entries")
++                        names.add(key)
++                        self.children[node.key['ino_num']].append(node)
++                else:
++                    raise ValueError(f"Unknown UBIFS indexed node type {head.node_type}")
++                if node.key != parent_key or node.key['type'] != head.node_type:
++                    raise ValueError("UBIFS node key/type disagrees with its index branch")
++        if d.UBIFS_ROOT_INO not in self.inodes:
++            raise ValueError("UBIFS committed index has no root inode")

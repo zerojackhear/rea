@@ -1,4 +1,5 @@
 import { expect, it, vi } from "vitest";
+import * as windowsNative from "../../windows/WindowsNativeLoader.js";
 import { processScenarioSchema } from "../../domain/process/processScenario.js";
 import { AnalysisCapabilityUnavailableError } from "../../domain/analysisErrorCore.js";
 import {
@@ -809,28 +810,39 @@ it("preserves cancellation while projecting observations and successful cleanup"
   });
 });
 
-it("fails closed on Windows before resolving or launching scenario paths", async () => {
-  const scenario = processScenarioSchema.parse({
-    executable: "Z:/missing/should-never-be-resolved.exe",
-    working_directory: "Z:/missing/working-directory",
-  });
-  const result = await captureProcessScenario(scenario, undefined, "win32");
-  if (result.ok) throw new Error("expected Windows ownership refusal");
-  if (!(result.error instanceof AnalysisCapabilityUnavailableError))
-    throw new Error("expected a capability-unavailable outcome");
-  expect(result.error).toMatchObject({
-    operation: "capture_process_scenario",
-    reason: expect.stringContaining("Windows PTY process capture"),
-  });
-  expect(projectAnalysisError(result.error)).toMatchObject({
-    code: "capability_unavailable",
-    category: "unsupported_provider",
-    message: expect.stringContaining("does not yet verify descendant cleanup"),
-    details: {
+it("fails closed without Windows native ownership before resolving scenario paths", async () => {
+  const native = vi
+    .spyOn(windowsNative, "systemWindowsNativeAuthority")
+    .mockReturnValue({
+      available: false,
+      failureStage: "artifact",
+      reason: "verification-artifact-missing",
+    });
+  try {
+    const scenario = processScenarioSchema.parse({
+      executable: "Z:/missing/should-never-be-resolved.exe",
+      working_directory: "Z:/missing/working-directory",
+    });
+    const result = await captureProcessScenario(scenario, undefined, "win32");
+    if (result.ok) throw new Error("expected Windows ownership refusal");
+    if (!(result.error instanceof AnalysisCapabilityUnavailableError))
+      throw new Error("expected a capability-unavailable outcome");
+    expect(result.error).toMatchObject({
       operation: "capture_process_scenario",
-      reason: result.error.reason,
-    },
-  });
+      reason: expect.stringContaining("Windows owned ConPTY capture"),
+    });
+    expect(projectAnalysisError(result.error)).toMatchObject({
+      code: "capability_unavailable",
+      category: "unsupported_provider",
+      message: expect.stringContaining("verification-artifact-missing"),
+      details: {
+        operation: "capture_process_scenario",
+        reason: result.error.reason,
+      },
+    });
+  } finally {
+    native.mockRestore();
+  }
 });
 
 it("retains the root start identity once at launch and signals only with it", async () => {

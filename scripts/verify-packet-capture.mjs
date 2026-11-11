@@ -14,9 +14,12 @@ import { PrivateRuntimeRoot } from "../dist/process/PrivateRuntimeRoot.js";
 import { parseEvidence } from "../dist/domain/evidence.js";
 import { createVerifierRun, completeVerifierRun } from "./lib/verifier-run.mjs";
 
-if (process.platform !== "linux")
+if (
+  process.platform !== "linux" &&
+  !(process.platform === "win32" && process.arch === "x64")
+)
   throw new Error(
-    "Real packet capture verification requires Linux with util-linux prlimit.",
+    "Real packet capture verification requires Linux with prlimit or native Windows x64.",
   );
 if (!isAbsolute(process.env.REA_TSHARK_COMMAND ?? ""))
   throw new Error("Supply absolute REA_TSHARK_COMMAND for TShark 4.x.");
@@ -31,9 +34,10 @@ const bluetooth = join(root.path, "bluetooth.pcap");
 const execute = promisify(execFile);
 const environment = {
   ...process.env,
-  TMPDIR: root.path,
-  TMP: root.path,
-  TEMP: root.path,
+  // A Windows native runtime lease cannot be another process's temp root.
+  ...(process.platform === "win32"
+    ? {}
+    : { TMPDIR: root.path, TMP: root.path, TEMP: root.path }),
 };
 const client = new Client({ name: "packet-capture-verifier", version: "1" });
 const transport = new StdioClientTransport({
@@ -93,18 +97,21 @@ const source = pcap(1, [
 const bluetoothSource = pcap(187, [Buffer.from("01030c00", "hex")]);
 let cases = 0;
 const discoveryMeasurements = [];
-const inheritedAddressSpace = (await readFile("/proc/self/limits", "utf8"))
-  .split("\n")
-  .find((line) => line.startsWith("Max address space "))
-  ?.trim()
-  .match(/^Max address space\s+(\S+)\s+(\S+)\s+bytes$/u);
-assert.ok(inheritedAddressSpace);
-const expectedAddressSpace = Math.min(
-  1073741824,
-  ...inheritedAddressSpace
-    .slice(1)
-    .map((value) => (value === "unlimited" ? Infinity : Number(value))),
-);
+let expectedAddressSpace = null;
+if (process.platform === "linux") {
+  const inheritedAddressSpace = (await readFile("/proc/self/limits", "utf8"))
+    .split("\n")
+    .find((line) => line.startsWith("Max address space "))
+    ?.trim()
+    .match(/^Max address space\s+(\S+)\s+(\S+)\s+bytes$/u);
+  assert.ok(inheritedAddressSpace);
+  expectedAddressSpace = Math.min(
+    1073741824,
+    ...inheritedAddressSpace
+      .slice(1)
+      .map((value) => (value === "unlimited" ? Infinity : Number(value))),
+  );
+}
 
 try {
   await writeFile(path, source);
@@ -138,15 +145,26 @@ try {
     assert.equal(report.hardware_acquisition, "not-performed");
     assert.equal(report.limits.address_space_bytes, expectedAddressSpace);
     assert.equal(report.tool.configured_path, process.env.REA_TSHARK_COMMAND);
-    assert.equal(
-      report.resource_limiter.configured_path,
-      process.env.REA_TSHARK_PRLIMIT_COMMAND ?? "/usr/bin/prlimit",
-    );
-    assert.ok(
-      report.resource_limiter.arguments.includes(
-        `--as=${expectedAddressSpace}:${expectedAddressSpace}`,
-      ),
-    );
+    if (process.platform === "win32") {
+      assert.deepEqual(report.resource_limiter, {
+        kind: "windows-job-object",
+        scope: "owned-process-tree",
+        memory_limit_bytes: 1073741824,
+      });
+      assert.equal(report.limits.job_memory_bytes, 1073741824);
+      assert.equal(report.limits.cpu_seconds, null);
+      assert.equal(report.limits.file_bytes, null);
+    } else {
+      assert.equal(
+        report.resource_limiter.configured_path,
+        process.env.REA_TSHARK_PRLIMIT_COMMAND ?? "/usr/bin/prlimit",
+      );
+      assert.ok(
+        report.resource_limiter.arguments.includes(
+          `--as=${expectedAddressSpace}:${expectedAddressSpace}`,
+        ),
+      );
+    }
     assert.equal(report.configuration, "private-empty-personal-profile");
     const flags = Object.entries(input)
       .filter(([key]) => key !== "path")

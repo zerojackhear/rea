@@ -17,18 +17,19 @@ import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { PrivateRuntimeRoot } from "../dist/process/PrivateRuntimeRoot.js";
 import { runOwnedCommand } from "../dist/process/OwnedCommand.js";
+import { MITMPROXY_CAPTURE_MEMORY_BYTES } from "../dist/browser/history/CaptureRelease.js";
 import { WEB_NETWORK_CAPTURE_LIMITS } from "../dist/domain/webNetworkCapture.js";
 import { mcpTextValue } from "./lib/mcp-verifier-results.mjs";
 import { createVerifierRun, completeVerifierRun } from "./lib/verifier-run.mjs";
 
 const executable = process.env.REA_MITMDUMP_COMMAND;
 if (
-  process.platform !== "linux" ||
+  (process.platform !== "linux" && process.platform !== "win32") ||
   executable === undefined ||
   !isAbsolute(executable)
 )
   throw new Error(
-    "verify:web:network-captures requires Linux and absolute REA_MITMDUMP_COMMAND for caller-supplied mitmdump 12.2.3",
+    "verify:web:network-captures requires Windows or Linux and absolute REA_MITMDUMP_COMMAND for caller-supplied mitmdump 12.2.3",
   );
 await access(executable);
 const entrypoint =
@@ -52,6 +53,7 @@ const transport = new StdioClientTransport({
 });
 const failures = [];
 let cases = 0;
+let restoreDeniedInput = async () => {};
 try {
   await runOwnedCommand(
     {
@@ -73,6 +75,9 @@ try {
       cwd: runtime.path,
       runId: `rea-history-fixture-${randomUUID()}`,
       hostEnvironment: environment,
+      ...(process.platform === "win32"
+        ? { memoryLimitBytes: MITMPROXY_CAPTURE_MEMORY_BYTES }
+        : {}),
     },
     { timeoutMs: 30_000, diagnosticBytes: 1024 * 1024 },
   );
@@ -442,7 +447,33 @@ try {
   cases++;
   const deniedPath = join(runtime.path, "unreadable.har");
   await copyFile(join(runtime.path, "producer.har"), deniedPath);
-  await chmod(deniedPath, 0o000);
+  if (process.platform === "win32") {
+    const system = join(process.env.SystemRoot, "System32");
+    const { stdout } = await promisify(execFile)(join(system, "whoami.exe"), [
+      "/user",
+      "/fo",
+      "csv",
+      "/nh",
+    ]);
+    const sid = stdout.match(/S-1-5-[0-9-]+/u)?.[0];
+    assert.ok(
+      sid,
+      "Cannot establish the current Windows SID for the owned denial fixture",
+    );
+    restoreDeniedInput = () =>
+      promisify(execFile)(join(system, "icacls.exe"), [
+        deniedPath,
+        "/remove:d",
+        `*${sid}`,
+      ]);
+    await promisify(execFile)(join(system, "icacls.exe"), [
+      deniedPath,
+      "/deny",
+      `*${sid}:(R)`,
+    ]);
+  } else {
+    await chmod(deniedPath, 0o000);
+  }
   for (const mode of ["cli", "mcp"]) {
     for (const format of ["har", "mitmproxy"]) {
       const failure = await inspect(
@@ -451,7 +482,13 @@ try {
         "unavailable",
       );
       assert.equal(failure.code, "access_denied");
-      assert.equal(failure.details.system_code, "EACCES");
+      assert.ok(
+        (process.platform === "win32"
+          ? ["EPERM", "EACCES"]
+          : ["EACCES"]
+        ).includes(failure.details.system_code),
+        `Expected an actual filesystem permission denial: ${failure.details.system_code}`,
+      );
       assert.equal(failure.details.path, deniedPath);
       cases++;
     }
@@ -853,6 +890,7 @@ try {
   for (const cleanup of [
     () => client.close(),
     () => transport.close(),
+    () => restoreDeniedInput(),
     () => runtime.close(),
   ]) {
     try {
@@ -864,8 +902,13 @@ try {
 }
 const verifier = await completeVerifierRun(run);
 try {
-  assert.equal(verifier.process_lineage.status, "verified");
-  assert.deepEqual(verifier.process_lineage.descendants, []);
+  // On Windows the invoking Job Object owner verifies the complete verifier
+  // tree after this process exits. Do not substitute PID/path enumeration for
+  // its retained lease or call this process's unavailable observation verified.
+  if (process.platform !== "win32") {
+    assert.equal(verifier.process_lineage.status, "verified");
+    assert.deepEqual(verifier.process_lineage.descendants, []);
+  }
 } catch (cause) {
   failures.push(cause);
 }

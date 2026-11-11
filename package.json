@@ -359,6 +359,13 @@
     "zod": "4.6.6"
   },
   "overrides": {
+    "@electron/asar": {
+      "glob": "14.0.2",
+      "minimatch": "11.0.1"
+    },
+    "frida": {
+      "minimatch": "11.0.1"
+    },
     "typed-rest-client": {
       "qs": "6.16.0"
     },

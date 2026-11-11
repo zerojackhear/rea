@@ -10,7 +10,9 @@ There is no environment override for loading an arbitrary native module.
 
 ## Build
 
-The artifact lane requires Linux, MinGW-w64 `x86_64-w64-mingw32-g++`,
+The artifact lane supports an existing Windows x64 MSVC Developer Command Prompt
+with the Windows SDK (`cl.exe`, `lib.exe`, `link.exe`, and `tar.exe`). It also
+supports Linux, MinGW-w64 `x86_64-w64-mingw32-g++`,
 `x86_64-w64-mingw32-dlltool`, and `tar`. It never installs these commands.
 Node-API headers are reused from the build cache or downloaded from the
 pinned official Node release with its published SHA-256 checked.
@@ -218,3 +220,9 @@ user, creates private temporary window-station objects, and launches the test
 inside a kill-on-close fixture job. It does not create accounts, modify host
 policy, or change the caller's token. A real-provider claim must additionally
 verify the packaged CLI and MCP on that ordinary-user token.
+
+## Debugger lifetime and output observation
+
+`process_debugger_spawn` is a separate launch mode for protocol-based debuggers. Its non-breakaway job observes membership but does not kill inferiors when its owner closes. It cannot be combined with AppContainer or commit limits. Whole-job termination is refused for this mode; the retained debugger handle can be terminated only after the TypeScript provider confirms no inferior or verified detachment. Ordinary provider jobs retain kill-on-close behavior.
+
+`debugger_inspect_stdio` performs bounded, read-only Windows x64 process inspection. It calibrates the SDK standard-handle layout against this host, binds observations to the held process creation time, and compares duplicated stdout/stderr handle identities to the selected regular NTFS file. It does not expose duplicated handles, write target memory, or grant target termination authority. Unsupported layouts, access failures, and changing identities remain unverified. GDB startup uses its own Python runtime to prevent its protocol pipes from leaking to future inferiors.

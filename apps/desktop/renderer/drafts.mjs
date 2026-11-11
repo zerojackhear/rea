@@ -9,7 +9,7 @@ import {
 } from "./schema.mjs";
 
 const PATH_FIELD =
-  /^(path|target_path|file_path|binary_path|artifact_path|application_path|application_root|database_path|input_path|root|directory)$/;
+  /^(path|target_path|file_path|binary_path|artifact_path|application_path|application_root|database_path|input_path|capture_path|manifest_path|root|directory)$/;
 
 /** One owner per tool retains the active representation across every navigation. */
 export class ToolDraftStore {
